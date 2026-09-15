@@ -1,0 +1,1 @@
+{"request_id":"req-decommission","reason":"tolerable_risk","justification":"This application will be retired next quarter.","status":"pending","expires_at":"2099-01-01T00:00:00Z","provenance":"operator_supplied"}

@@ -1,0 +1,11 @@
+{
+  "name": "dependency-risk-judge",
+  "display_name": "Dependency Risk Judge",
+  "description": "No-tool review of one validated dependency-risk finding.",
+  "prompt_asset": "agents/dependency-risk-judge/prompt.md",
+  "tools": [],
+  "skills": [
+    "dependency-risk-review"
+  ],
+  "infer": false
+}

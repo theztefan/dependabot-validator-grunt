@@ -1,0 +1,20 @@
+{
+  "tools": [
+    {
+      "name": "list_files",
+      "description": "List repository-relative file paths under a directory."
+    },
+    {
+      "name": "read_file",
+      "description": "Read one repository-relative UTF-8 file."
+    },
+    {
+      "name": "search",
+      "description": "Find literal text and return citable repository facts."
+    },
+    {
+      "name": "analyze_reachability",
+      "description": "Run task-bound structural package-usage analysis and return citable evidence."
+    }
+  ]
+}

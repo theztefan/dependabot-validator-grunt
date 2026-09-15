@@ -1,0 +1,39 @@
+{
+  "policy_id": "default-npm-dismissal",
+  "version": "2.0.0",
+  "routes": {
+    "fix_started": {"mode": "deterministic", "permitted_final": ["deny", "human_review"]},
+    "no_bandwidth": {"mode": "deterministic", "permitted_final": ["deny", "human_review"]},
+    "not_used": {"mode": "deterministic_then_agentic", "permitted_final": ["approve", "deny", "human_review"], "agent_permitted": ["approve", "deny", "human_review"], "agent_approval_codes": ["vulnerable_symbol_unused"]},
+    "inaccurate": {"mode": "deterministic_then_agentic", "permitted_final": ["approve", "deny", "human_review"], "agent_permitted": ["deny", "human_review"]},
+    "tolerable_risk": {"mode": "deterministic_then_agentic", "permitted_final": ["deny", "human_review"], "agent_permitted": ["deny", "human_review"]}
+  },
+  "enabled_rules": [
+    "deny_fix_started",
+    "deny_no_bandwidth",
+    "approve_package_absent",
+    "approve_unaffected_versions",
+    "triage_absent_does_not_apply",
+    "triage_unaffected_does_not_apply",
+    "triage_vulnerable_applies",
+    "triage_inconclusive_human_review"
+  ],
+  "triage_agent_permitted": ["approve", "deny", "human_review"],
+  "triage_agent_approval_codes": ["vulnerable_symbol_unused", "dev_only_scope"],
+  "minimum_agent_approval_confidence": 0.85,
+  "limits": {
+    "max_attempts": 2,
+    "wall_clock_seconds": 360,
+    "max_dependency_file_bytes": 33554432,
+    "max_read_bytes": 2097152,
+    "max_results": 200,
+    "max_session_bytes": 33554432,
+    "max_proof_scan_bytes": 67108864,
+    "analyzer_wall_seconds": 60,
+    "max_analyzer_files": 10000,
+    "max_analyzer_input_bytes": 67108864,
+    "max_analyzer_output_bytes": 4194304,
+    "max_analyzer_stderr_bytes": 262144,
+    "max_analyzer_findings": 500
+  }
+}

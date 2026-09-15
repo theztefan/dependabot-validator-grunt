@@ -1,0 +1,1 @@
+{"alert_number":1,"advisory_id":"GHSA-demo-0001","summary":"Synthetic lodash advisory.","severity":"high","package_name":"lodash","vulnerable_range":"< 4.17.21","patched_versions":">= 4.17.21","manifest_path":"package-lock.json","scope":"runtime"}
