@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from typing import Any, cast
+from urllib.parse import urlparse
 
 import yaml
 from pydantic import TypeAdapter, ValidationError
@@ -17,7 +18,7 @@ from dependabot_validator_grunt.dependency_graph import (
     DependencyGraph,
     DependencyNode,
 )
-from dependabot_validator_grunt.models import NpmDeclaration
+from dependabot_validator_grunt.models import DependencyDeclaration, SourceKind
 
 _SEMVER = re.compile(
     r"^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
@@ -125,10 +126,59 @@ def _dependency_target(
     return actual_name, matches[0] if len(matches) == 1 else None
 
 
+def _source_metadata(
+    version: str | None,
+    resolution: dict[str, object],
+) -> tuple[SourceKind, str | None]:
+    if isinstance(version, str) and version.casefold().startswith("workspace:"):
+        return "workspace", version
+    directory = resolution.get("directory")
+    if isinstance(directory, str):
+        return "path", directory
+    tarball = resolution.get("tarball")
+    if isinstance(tarball, str):
+        lowered = tarball.casefold()
+        if lowered.startswith(("git+", "git://", "ssh://", "git@")):
+            return "vcs", tarball
+        if lowered.startswith(("file:", "./", "../", "/")):
+            return "path", tarball
+        parsed = urlparse(tarball)
+        if parsed.scheme.casefold() in {"http", "https"}:
+            if (parsed.hostname or "").casefold() in {
+                "registry.npmjs.org",
+                "registry.yarnpkg.com",
+            }:
+                return "registry", tarball
+            return "url", tarball
+        return "unknown", tarball
+    if isinstance(version, str):
+        lowered = version.casefold()
+        if lowered.startswith(
+            ("git+", "git://", "ssh://", "git@", "github:", "gitlab:", "bitbucket:")
+        ):
+            return "vcs", version
+        if lowered.startswith(("file:", "link:", "./", "../", "/")):
+            return "path", version
+        if lowered.startswith("npm:"):
+            return "registry", version
+        parsed = urlparse(version)
+        if parsed.scheme.casefold() in {"http", "https"}:
+            if (parsed.hostname or "").casefold() in {
+                "registry.npmjs.org",
+                "registry.yarnpkg.com",
+            }:
+                return "registry", version
+            return "url", version
+    integrity = resolution.get("integrity")
+    if isinstance(integrity, str) and integrity.strip():
+        return "registry", None
+    return "unknown", None
+
+
 def parse_pnpm_v9(
     text: str,
     *,
-    declarations: tuple[NpmDeclaration, ...],
+    declarations: tuple[DependencyDeclaration, ...],
 ) -> DependencyGraph:
     """Parse pnpm lockfile v9 into a normalized graph."""
     parsed = _yaml_documents(text)
@@ -151,6 +201,7 @@ def parse_pnpm_v9(
         )
         registry_integrity = isinstance(integrity, str) and bool(integrity.strip())
         registry_source = registry_tarball or registry_integrity
+        source_kind, source_locator = _source_metadata(version_value, resolution)
         nodes.append(
             DependencyNode(
                 instance_id=f"pnpm:{instance_id}",
@@ -159,6 +210,8 @@ def parse_pnpm_v9(
                 comparable=bool(
                     registry_source and version_value and _SEMVER.fullmatch(version_value)
                 ),
+                source_kind=source_kind,
+                source_locator=source_locator,
             )
         )
     prefixed_node_ids = {f"pnpm:{node_id}" for node_id in node_ids}
@@ -210,7 +263,6 @@ def parse_pnpm_v9(
         if edge.target_id is not None and edge.target_id not in prefixed_node_ids
     )
     return DependencyGraph(
-        package_manager="pnpm",
         lockfile_version=version,
         nodes=tuple(nodes),
         edges=tuple(edges),

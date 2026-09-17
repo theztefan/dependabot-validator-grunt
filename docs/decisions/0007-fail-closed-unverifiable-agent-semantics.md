@@ -2,6 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-09-04
+- **Amends:** ADR 0003 and ADR 0005
 - **Supersedes:** ADR 0006's temporary trust in agent-assessed
   `tolerable_risk` specificity and citation-only reachable denials
 - **Amended by:** ADR 0011 and ADR 0017
@@ -39,7 +40,7 @@ which could concatenate words and alter the text being assessed.
   typed reachability/exploitability proof model exists. Verified package usage
   may support `advisory_applies`; unsupported reachability proposals fail
   closed.
-- Scope `injection_detected` to agentic analysis. Deterministic terminal
+- Scope `injection_detected` to investigator analysis. Deterministic terminal
   decisions do not interpret or execute requester text and therefore do not
   require prompt-injection classification.
 - Validate triage policy configuration with the same fail-closed principles:

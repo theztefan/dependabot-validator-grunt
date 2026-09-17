@@ -19,7 +19,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from pydantic import (
     BaseModel,
@@ -33,8 +33,10 @@ from pydantic import (
 from dependabot_validator_grunt.agentic import path_is_denied
 from dependabot_validator_grunt.models import (
     AlertSnapshot,
+    Ecosystem,
     RepositorySnapshot,
     RequestSnapshot,
+    normalize_package_identifier,
     stable_digest,
 )
 
@@ -49,6 +51,9 @@ DEPENDENCY_FILE_NAMES = {
     "npm-shrinkwrap.json",
     "yarn.lock",
     "pnpm-lock.yaml",
+    "pyproject.toml",
+    "poetry.lock",
+    "uv.lock",
 }
 
 GHEC_API_URL = "https://api.github.com"
@@ -362,6 +367,7 @@ class _RawDependency(_RawModel):
     package: _RawPackage
     manifest_path: str
     scope: Literal["runtime", "development"] | None = None
+    relationship: Literal["direct", "transitive", "inconclusive", "unknown"] | None = None
 
 
 class _RawCvssEntry(_RawModel):
@@ -505,12 +511,26 @@ def normalize_dependabot_alert(raw: dict[str, object], *, alert_number: int) -> 
         raise GitHubCollectionError("GitHub response was malformed") from None
     if parsed.number != alert_number:
         raise GitHubCollectionError("GitHub response did not match the expected alert")
-    if parsed.dependency.package.ecosystem != "npm":
-        raise GitHubCollectionError("only the npm ecosystem is supported")
+    raw_ecosystem = parsed.dependency.package.ecosystem
+    if raw_ecosystem not in {"npm", "pip", "uv"}:
+        raise GitHubCollectionError("only npm, pip, and uv ecosystems are supported")
+    ecosystem = cast(Ecosystem, raw_ecosystem)
     advisory = parsed.security_advisory
     vulnerability = parsed.security_vulnerability
-    if vulnerability.package.ecosystem != "npm" or (
-        vulnerability.package.name != parsed.dependency.package.name
+    try:
+        dependency_identity = normalize_package_identifier(
+            ecosystem,
+            parsed.dependency.package.name,
+        )
+        vulnerability_identity = normalize_package_identifier(
+            ecosystem,
+            vulnerability.package.name,
+        )
+    except ValueError:
+        raise GitHubCollectionError("GitHub response was malformed") from None
+    if (
+        vulnerability.package.ecosystem != ecosystem
+        or vulnerability_identity != dependency_identity
     ):
         raise GitHubCollectionError("GitHub response contained contradictory package metadata")
     cvss: float | None = None
@@ -529,6 +549,9 @@ def normalize_dependabot_alert(raw: dict[str, object], *, alert_number: int) -> 
         else None
     )
     scope: Literal["runtime", "development", "unknown"] = parsed.dependency.scope or "unknown"
+    relationship: Literal["direct", "transitive", "inconclusive", "unknown"] = (
+        parsed.dependency.relationship or "unknown"
+    )
     try:
         return AlertSnapshot(
             alert_number=parsed.number,
@@ -539,11 +562,13 @@ def normalize_dependabot_alert(raw: dict[str, object], *, alert_number: int) -> 
             cvss=cvss,
             epss=advisory.epss.percentage if advisory.epss is not None else None,
             cwes=tuple(cwe.cwe_id for cwe in advisory.cwes),
+            ecosystem=ecosystem,
             package_name=parsed.dependency.package.name,
             vulnerable_range=vulnerability.vulnerable_version_range,
             patched_versions=patched,
             manifest_path=parsed.dependency.manifest_path,
             scope=scope,
+            dependency_relationship=relationship,
             raw_response_digest=stable_digest(raw),
         )
     except ValidationError:
@@ -651,8 +676,37 @@ def _member_relative_path(member: tarfile.TarInfo, root_prefix: str) -> str:
     return "/".join(remainder)
 
 
-def _normalized_duplicate_key(relative: str) -> str:
-    return unicodedata.normalize("NFC", relative).casefold()
+def _normalized_collision_prefixes(paths: list[str]) -> set[tuple[str, ...]]:
+    spellings: dict[tuple[tuple[str, ...], str], set[str]] = {}
+    normalized_path_counts: dict[tuple[str, ...], int] = {}
+    for relative in paths:
+        normalized_parent: tuple[str, ...] = ()
+        for part in PurePosixPath(relative).parts:
+            normalized_part = unicodedata.normalize("NFC", part).casefold()
+            spellings.setdefault((normalized_parent, normalized_part), set()).add(part)
+            normalized_parent = (*normalized_parent, normalized_part)
+        normalized_path_counts[normalized_parent] = (
+            normalized_path_counts.get(normalized_parent, 0) + 1
+        )
+    return {
+        (*parent, normalized_part)
+        for (parent, normalized_part), values in spellings.items()
+        if len(values) > 1
+    } | {path for path, count in normalized_path_counts.items() if count > 1}
+
+
+def _normalized_path_parts(relative: str) -> tuple[str, ...]:
+    return tuple(
+        unicodedata.normalize("NFC", part).casefold() for part in PurePosixPath(relative).parts
+    )
+
+
+def _path_has_collision(
+    relative: str,
+    collision_prefixes: set[tuple[str, ...]],
+) -> bool:
+    parts = _normalized_path_parts(relative)
+    return any(parts[: len(prefix)] == prefix for prefix in collision_prefixes)
 
 
 def _safe_destination_path(destination: Path, relative: str) -> Path:
@@ -660,6 +714,21 @@ def _safe_destination_path(destination: Path, relative: str) -> Path:
     if any(part in ("", ".", "..") for part in parts):
         raise GitHubCollectionError("archive member escapes the destination root")
     return destination.joinpath(*parts)
+
+
+def dependency_file_uses_extended_limit(
+    relative_path: str,
+    *,
+    selected_dependency_path: str | None = None,
+) -> bool:
+    """Return whether one normalized path receives the dependency-file limit."""
+    normalized = PurePosixPath(relative_path).as_posix()
+    if PurePosixPath(normalized).name in DEPENDENCY_FILE_NAMES:
+        return True
+    if selected_dependency_path is None:
+        return False
+    selected = PurePosixPath(selected_dependency_path).as_posix()
+    return normalized == selected and PurePosixPath(selected).suffix in {".txt", ".in"}
 
 
 def extract_repository_tarball(
@@ -671,6 +740,7 @@ def extract_repository_tarball(
     default_branch: str,
     commit_sha: str,
     limits: Limits,
+    selected_dependency_path: str | None = None,
 ) -> RepositorySnapshot:
     """Validate the entire archive, then manually extract a read-only snapshot.
 
@@ -690,42 +760,66 @@ def extract_repository_tarball(
             if len(members) > limits.max_archive_members:
                 raise GitHubCollectionError("archive exceeded the configured member limit")
             root_prefix = _validate_root_prefix(members)
+            normalized_members = [
+                (_member_relative_path(member, root_prefix), member) for member in members
+            ]
+            collision_prefixes = _normalized_collision_prefixes(
+                [relative for relative, _ in normalized_members if relative]
+            )
+            if selected_dependency_path is not None and _path_has_collision(
+                PurePosixPath(selected_dependency_path).as_posix(),
+                collision_prefixes,
+            ):
+                raise GitHubCollectionError("selected dependency path collides after normalization")
+
             plan: list[tuple[str, tarfile.TarInfo, bool]] = []
-            seen: set[str] = set()
+            coverage_excluded_prefixes = {
+                relative
+                for relative, _ in normalized_members
+                if relative and _path_has_collision(relative, collision_prefixes)
+            }
             expanded_total = 0
-            for member in members:
-                relative = _member_relative_path(member, root_prefix)
-                duplicate_key = _normalized_duplicate_key(relative)
-                if duplicate_key in seen:
-                    raise GitHubCollectionError("archive contains duplicate normalized paths")
-                seen.add(duplicate_key)
+            for relative, member in normalized_members:
+                collides = _path_has_collision(relative, collision_prefixes)
                 if relative == "":
                     continue  # the root directory entry itself; nothing to create
                 if member.isdir():
-                    plan.append((relative, member, False))
+                    plan.append((relative, member, collides))
                     continue
                 if member.isreg() and not member.issparse():
-                    member_limit = (
-                        limits.max_dependency_file_bytes
-                        if PurePosixPath(relative).name in DEPENDENCY_FILE_NAMES
-                        else limits.max_archive_file_bytes
-                    )
-                    if member.size > member_limit:
-                        raise GitHubCollectionError(
-                            "archive member exceeded the configured file byte limit"
-                        )
                     expanded_total += member.size
                     if expanded_total > limits.expanded_bytes:
                         raise GitHubCollectionError(
                             "archive exceeded the configured expanded byte limit"
                         )
-                    plan.append((relative, member, False))
+                    member_limit = (
+                        limits.max_dependency_file_bytes
+                        if dependency_file_uses_extended_limit(
+                            relative,
+                            selected_dependency_path=selected_dependency_path,
+                        )
+                        else limits.max_archive_file_bytes
+                    )
+                    if member.size > member_limit:
+                        if (
+                            selected_dependency_path is not None
+                            and PurePosixPath(relative).as_posix()
+                            == PurePosixPath(selected_dependency_path).as_posix()
+                        ):
+                            raise GitHubCollectionError(
+                                "selected dependency file exceeded the configured byte limit"
+                            )
+                        coverage_excluded_prefixes.add(relative)
+                        plan.append((relative, member, True))
+                        continue
+                    plan.append((relative, member, collides))
                     continue
                 plan.append((relative, member, True))
             resolved_destination = destination.resolve()
             resolved_destination.mkdir(parents=True, exist_ok=True)
             included: list[str] = []
             excluded: list[str] = []
+            coverage_excluded: list[str] = []
             excluded_prefixes = {relative for relative, _, unsupported in plan if unsupported}
             created_directories: set[Path] = {resolved_destination}
             for relative, member, unsupported in plan:
@@ -743,6 +837,11 @@ def extract_repository_tarball(
                 if member.isdir():
                     if denied:
                         excluded.append(relative)
+                        if any(
+                            relative == prefix or relative.startswith(f"{prefix}/")
+                            for prefix in coverage_excluded_prefixes
+                        ):
+                            coverage_excluded.append(relative)
                         continue
                     target.mkdir(parents=True, exist_ok=True)
                     directory = target
@@ -752,6 +851,11 @@ def extract_repository_tarball(
                     continue
                 if denied:
                     excluded.append(relative)
+                    if any(
+                        relative == prefix or relative.startswith(f"{prefix}/")
+                        for prefix in coverage_excluded_prefixes
+                    ):
+                        coverage_excluded.append(relative)
                     continue
                 target.parent.mkdir(parents=True, exist_ok=True)
                 parent = target.parent
@@ -780,6 +884,7 @@ def extract_repository_tarball(
         default_branch=default_branch,
         snapshot_id=commit_sha,
         provenance="ghec_attested",
-        included_paths=tuple(sorted(included)),
-        excluded_paths=tuple(sorted(excluded)),
+        included_paths=tuple(sorted(set(included))),
+        excluded_paths=tuple(sorted(set(excluded))),
+        coverage_excluded_paths=tuple(sorted(set(coverage_excluded))),
     )

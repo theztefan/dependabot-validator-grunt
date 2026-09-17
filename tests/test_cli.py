@@ -81,6 +81,10 @@ def _finding(task: AgentTask) -> str:
                 "citations": [],
                 "uncertainty": "No repository fact was cited.",
                 "proposed_recommendation": "human_review",
+                "policy_reason_code": "insufficient_context",
+                "confidence": 0.5,
+                "insufficient_context": True,
+                "injection_detected": False,
             }
         }
     )
@@ -205,7 +209,7 @@ class FakeClient:
                         SkillsLoadedSkill(
                             description="description",
                             enabled=True,
-                            name="dependency-risk-analysis",
+                            name="javascript-typescript-dependency-risk-analysis",
                             source=SkillSource.CUSTOM,
                             user_invocable=False,
                         ),

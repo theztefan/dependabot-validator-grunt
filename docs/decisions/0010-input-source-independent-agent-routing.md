@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-09-08
 - **Amends:** ADR 0009's offline routing exception
-- **Amended by:** ADR 0019
+- **Amended by:** ADR 0019 and ADR 0021
 
 ## Context
 

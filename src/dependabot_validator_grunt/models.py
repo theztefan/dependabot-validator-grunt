@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import keyword
 import re
 import unicodedata
 from datetime import datetime
-from typing import Literal
+from pathlib import PurePosixPath
+from typing import Literal, assert_never
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_core import to_jsonable_python
+
+Ecosystem = Literal["npm", "pip", "uv"]
+PackageManager = Literal["npm", "yarn-classic", "pnpm", "pip", "poetry", "uv"]
+VersionScheme = Literal["npm", "pep440"]
+AnalysisFamily = Literal["javascript_typescript", "python"]
+SourceKind = Literal["registry", "url", "vcs", "path", "workspace", "unknown"]
 
 
 class FrozenModel(BaseModel):
@@ -21,6 +29,18 @@ class FrozenModel(BaseModel):
 
 _SAFE_IDENTIFIER_COMPONENT = re.compile(r"^[A-Za-z0-9._~!()*'-]+$")
 _SAFE_IDENTIFIER_MAX_LENGTH = 512
+_DEPENDENCY_EDGE_REQUIREMENT_MAX_LENGTH = 512
+_PYTHON_DISTRIBUTION_NAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
+AGENT_TASK_INSTALLED_INSTANCE_SAMPLE_LIMIT = 20
+AGENT_TASK_DEPENDENCY_CONSUMER_SAMPLE_LIMIT = 20
+AGENT_TASK_DEPENDENCY_PATH_SAMPLE_LIMIT = 8
+AGENT_TASK_DECLARATION_SAMPLE_LIMIT = 20
+AGENT_TASK_PROVENANCE_SAMPLE_LIMIT = 20
+MAX_AGENT_TASK_CHARACTERS = 24_000
+
+
+class AgentTaskSizeError(RuntimeError):
+    """A trusted model-facing task exceeds its aggregate serialized limit."""
 
 
 def validate_safe_identifier(value: str) -> str:
@@ -49,6 +69,46 @@ def validate_safe_identifier(value: str) -> str:
     return value
 
 
+def normalize_package_identifier(ecosystem: Ecosystem, value: str) -> str:
+    """Validate one package name and return its ecosystem identity."""
+    match ecosystem:
+        case "npm":
+            return validate_safe_identifier(value)
+        case "pip" | "uv":
+            if (
+                not value
+                or len(value) > _SAFE_IDENTIFIER_MAX_LENGTH
+                or value != value.strip()
+                or _PYTHON_DISTRIBUTION_NAME.fullmatch(value) is None
+            ):
+                raise ValueError("package identifier must be a safe identifier")
+            return re.sub(r"[-_.]+", "-", value).lower()
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+def analysis_family(ecosystem: Ecosystem) -> AnalysisFamily:
+    """Return the explicit source-language analysis family."""
+    match ecosystem:
+        case "npm":
+            return "javascript_typescript"
+        case "pip" | "uv":
+            return "python"
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+def version_scheme_for_ecosystem(ecosystem: Ecosystem) -> VersionScheme:
+    """Return the explicit version-comparison scheme."""
+    match ecosystem:
+        case "npm":
+            return "npm"
+        case "pip" | "uv":
+            return "pep440"
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
 def canonical_json(value: object) -> str:
     """Return stable compact JSON."""
     data = to_jsonable_python(value)
@@ -60,6 +120,17 @@ def canonical_json(value: object) -> str:
 def stable_digest(value: object) -> str:
     """Return a SHA-256 digest of canonical JSON."""
     return hashlib.sha256(canonical_json(value).encode()).hexdigest()
+
+
+def validate_dependency_edge_requirement(value: str) -> str:
+    """Validate one bounded dependency-edge requirement."""
+    if (
+        not value
+        or len(value) > _DEPENDENCY_EDGE_REQUIREMENT_MAX_LENGTH
+        or any(unicodedata.category(character).startswith("C") for character in value)
+    ):
+        raise ValueError("dependency path edge requirements must be bounded text")
+    return value
 
 
 class RequestSnapshot(FrozenModel):
@@ -89,17 +160,23 @@ class AlertSnapshot(FrozenModel):
     cvss: float | None = None
     epss: float | None = None
     cwes: tuple[str, ...] = ()
+    ecosystem: Ecosystem = "npm"
     package_name: str
+    package_identity: str = ""
     vulnerable_range: str
     patched_versions: str | None = None
     manifest_path: str = "package-lock.json"
     scope: Literal["runtime", "development", "unknown"] = "unknown"
+    dependency_relationship: Literal["direct", "transitive", "inconclusive", "unknown"] = "unknown"
     raw_response_digest: str
 
-    @field_validator("package_name")
-    @classmethod
-    def validate_package_name(cls, value: str) -> str:
-        return validate_safe_identifier(value)
+    @model_validator(mode="after")
+    def validate_package_identity(self) -> AlertSnapshot:
+        identity = normalize_package_identifier(self.ecosystem, self.package_name)
+        if self.package_identity and self.package_identity != identity:
+            raise ValueError("package identity does not match the package name")
+        object.__setattr__(self, "package_identity", identity)
+        return self
 
 
 class RepositorySnapshot(FrozenModel):
@@ -110,29 +187,77 @@ class RepositorySnapshot(FrozenModel):
     provenance: Literal["offline_fixture", "ghec_attested"]
     included_paths: tuple[str, ...]
     excluded_paths: tuple[str, ...] = ()
+    coverage_excluded_paths: tuple[str, ...] = ()
 
 
-class NpmInstance(FrozenModel):
+class DependencyInstance(FrozenModel):
     path: str
     version: str | None
-    relationship: Literal[
-        "root", "workspace", "direct", "development", "optional", "transitive", "unknown"
-    ]
+    relationship: Literal["workspace", "direct", "development", "optional", "transitive", "unknown"]
     comparable: bool = True
     development_only: bool = False
+    source_kind: SourceKind
+    source_locator: str | None = None
 
 
-class NpmDeclaration(FrozenModel):
+class DependencyDeclaration(FrozenModel):
     manifest_path: str
     name: str
     spec: str
     relationship: Literal["direct", "development", "optional", "peer"]
     alias_target: str | None = None
     exact_version: str | None = None
+    marker: str | None = None
+    source_kind: SourceKind = "registry"
+    source_locator: str | None = None
 
 
-class NpmEvidence(FrozenModel):
-    package_manager: Literal["npm", "yarn-classic", "pnpm"] = "npm"
+class DependencyPathNode(FrozenModel):
+    instance_id: str
+    package_name: str
+    version: str | None = None
+
+
+class DependencyPath(FrozenModel):
+    nodes: tuple[DependencyPathNode, ...]
+    edge_kinds: tuple[Literal["runtime", "development", "optional", "peer", "transitive"], ...]
+    edge_requirements: tuple[str | None, ...]
+    conditions: tuple[str | None, ...]
+    conditional: bool = False
+    development_only: bool = False
+    cycle_detected: bool = False
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> DependencyPath:
+        edge_count = max(len(self.nodes) - 1, 0)
+        if (
+            len(self.edge_kinds) != edge_count
+            or len(self.edge_requirements) != edge_count
+            or len(self.conditions) != edge_count
+        ):
+            raise ValueError("dependency path edges must connect every adjacent node")
+        if not self.nodes:
+            raise ValueError("dependency path requires at least one node")
+        for requirement in self.edge_requirements:
+            if requirement is not None:
+                validate_dependency_edge_requirement(requirement)
+        if self.conditional != any(condition is not None for condition in self.conditions):
+            raise ValueError("dependency path conditional state is inconsistent")
+        return self
+
+
+class DependencyProvenance(FrozenModel):
+    kind: Literal["requirement_include", "constraint_include", "pip_compile_via"]
+    source_path: str
+    line: int = Field(gt=0)
+    target: str
+    authoritative: Literal[False] = False
+
+
+class DependencyEvidence(FrozenModel):
+    ecosystem: Ecosystem = "npm"
+    package_manager: PackageManager = "npm"
+    version_scheme: VersionScheme = "npm"
     lockfile_version: str | None
     lockfile_path: str | None = None
     proof_capabilities: tuple[
@@ -145,12 +270,24 @@ class NpmEvidence(FrozenModel):
         ...,
     ] = ()
     package_name: str
-    instances: tuple[NpmInstance, ...]
+    package_identity: str = ""
+    instances: tuple[DependencyInstance, ...]
     manifest_paths: tuple[str, ...]
     completeness: Literal["complete", "partial", "unsupported"]
-    declarations: tuple[NpmDeclaration, ...] = ()
+    declarations: tuple[DependencyDeclaration, ...] = ()
     dependency_consumers: tuple[str, ...] = ()
+    dependency_paths: tuple[DependencyPath, ...] = ()
+    dependency_provenance: tuple[DependencyProvenance, ...] = ()
+    dependency_paths_truncated: bool = False
     issues: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_package_identity(self) -> DependencyEvidence:
+        identity = normalize_package_identifier(self.ecosystem, self.package_name)
+        if self.package_identity and self.package_identity != identity:
+            raise ValueError("dependency evidence identity does not match the package name")
+        object.__setattr__(self, "package_identity", identity)
+        return self
 
 
 class EvidenceItem(FrozenModel):
@@ -170,14 +307,14 @@ class PolicyIdentity(FrozenModel):
 
 
 class EvidenceBundle(FrozenModel):
-    evidence_format_version: Literal["1.2"] = "1.2"
+    evidence_format_version: Literal["3.0"] = "3.0"
     run_mode: Literal["offline_fixture", "live_ghec"]
     workflow_mode: Literal["dismissal", "triage"]
     correlation_id: str
     request: RequestSnapshot | None = None
     alert: AlertSnapshot
     repository: RepositorySnapshot
-    npm: NpmEvidence
+    dependency: DependencyEvidence
     evidence_items: tuple[EvidenceItem, ...]
     policy: PolicyIdentity
     digest: str
@@ -188,6 +325,20 @@ class EvidenceBundle(FrozenModel):
             raise ValueError("dismissal evidence requires a request")
         if self.workflow_mode == "triage" and self.request is not None:
             raise ValueError("triage evidence cannot contain a dismissal request")
+        if self.alert.ecosystem != self.dependency.ecosystem:
+            raise ValueError("alert and dependency ecosystems must match")
+        if self.alert.package_identity != self.dependency.package_identity:
+            raise ValueError("alert and dependency package identities must match")
+        expected_scheme = version_scheme_for_ecosystem(self.alert.ecosystem)
+        if self.dependency.version_scheme != expected_scheme:
+            raise ValueError("dependency version scheme does not match the ecosystem")
+        allowed_managers: dict[Ecosystem, set[PackageManager]] = {
+            "npm": {"npm", "yarn-classic", "pnpm"},
+            "pip": {"pip", "poetry", "uv"},
+            "uv": {"uv"},
+        }
+        if self.dependency.package_manager not in allowed_managers[self.alert.ecosystem]:
+            raise ValueError("dependency package manager does not match the ecosystem")
         return self
 
 
@@ -216,6 +367,7 @@ RepositoryReferenceStatus = Literal[
     "insufficient",
 ]
 RepositoryReferenceInsufficiencyCode = Literal[
+    "snapshot_excluded_path",
     "lstat_failed",
     "proof_budget_exceeded",
     "read_failed",
@@ -230,6 +382,29 @@ RepositoryReferenceInsufficiencyCode = Literal[
 class RepositoryReferenceInsufficiencyReason(FrozenModel):
     code: RepositoryReferenceInsufficiencyCode
     count: int = Field(gt=0)
+
+
+class ImportTarget(FrozenModel):
+    value: str
+    provenance: Literal["canonical_distribution", "curated_mapping"]
+    authoritative: bool = False
+
+    @field_validator("value")
+    @classmethod
+    def validate_import_target(cls, value: str) -> str:
+        validate_safe_identifier(value)
+        if not value.isidentifier() or keyword.iskeyword(value):
+            raise ValueError("import target must be one top-level Python identifier")
+        return value
+
+    @model_validator(mode="after")
+    def validate_authority(self) -> ImportTarget:
+        if self.authoritative and self.provenance not in {
+            "canonical_distribution",
+            "curated_mapping",
+        }:
+            raise ValueError("authoritative import target provenance is unsupported")
+        return self
 
 
 class RepositoryReferenceEvidence(FrozenModel):
@@ -276,7 +451,7 @@ class RepositoryReferenceEvidence(FrozenModel):
 
 
 class AgentTask(FrozenModel):
-    task_format_version: Literal["1.3"] = "1.3"
+    task_format_version: Literal["3.0"] = "3.0"
     workflow_mode: Literal["dismissal", "triage"] = "dismissal"
     correlation_id: str
     repository_id: str
@@ -287,16 +462,24 @@ class AgentTask(FrozenModel):
     dismissal_reason: str | None = None
     justification: str = ""
     advisory_summary: str = ""
+    ecosystem: Ecosystem = "npm"
     package_name: str = ""
+    package_identity: str = ""
     vulnerable_range: str = ""
     manifest_path: str = ""
+    analysis_root: str = ""
     dependency_scope: Literal["runtime", "development", "unknown"] = "unknown"
-    installed_instances: tuple[str, ...] = ()
-    installed_instance_count: int = 0
-    installed_instance_details: tuple[NpmInstance, ...] = ()
-    dependency_package_manager: Literal["npm", "yarn-classic", "pnpm"] = "npm"
+    dependency_relationship: Literal["direct", "transitive", "inconclusive", "unknown"] = "unknown"
+    installed_instance_count: int = Field(default=0, ge=0)
+    installed_instance_details: tuple[DependencyInstance, ...] = Field(
+        default=(),
+        max_length=AGENT_TASK_INSTALLED_INSTANCE_SAMPLE_LIMIT,
+    )
+    installed_instance_details_truncated: bool = False
+    dependency_package_manager: PackageManager = "npm"
+    dependency_version_scheme: VersionScheme = "npm"
     dependency_lockfile_version: str | None = None
-    npm_completeness: Literal["complete", "partial", "unsupported"] = "unsupported"
+    dependency_completeness: Literal["complete", "partial", "unsupported"] = "unsupported"
     dependency_evidence_capabilities: tuple[
         Literal[
             "resolved_instances",
@@ -306,9 +489,32 @@ class AgentTask(FrozenModel):
         ],
         ...,
     ] = ()
-    dependency_consumers: tuple[str, ...] = ()
-    manifest_declarations: tuple[NpmDeclaration, ...] = ()
-    repository_file_count: int = 0
+    dependency_consumer_count: int = Field(default=0, ge=0)
+    dependency_consumers: tuple[str, ...] = Field(
+        default=(),
+        max_length=AGENT_TASK_DEPENDENCY_CONSUMER_SAMPLE_LIMIT,
+    )
+    dependency_consumers_truncated: bool = False
+    dependency_path_count: int = Field(default=0, ge=0)
+    dependency_paths: tuple[DependencyPath, ...] = Field(
+        default=(),
+        max_length=AGENT_TASK_DEPENDENCY_PATH_SAMPLE_LIMIT,
+    )
+    dependency_paths_truncated: bool = False
+    import_targets: tuple[ImportTarget, ...] = ()
+    manifest_declaration_count: int = Field(default=0, ge=0)
+    manifest_declarations: tuple[DependencyDeclaration, ...] = Field(
+        default=(),
+        max_length=AGENT_TASK_DECLARATION_SAMPLE_LIMIT,
+    )
+    manifest_declarations_truncated: bool = False
+    dependency_provenance_count: int = Field(default=0, ge=0)
+    dependency_provenance: tuple[DependencyProvenance, ...] = Field(
+        default=(),
+        max_length=AGENT_TASK_PROVENANCE_SAMPLE_LIMIT,
+    )
+    dependency_provenance_truncated: bool = False
+    repository_file_count: int = Field(default=0, ge=0)
     repository_reference_evidence: RepositoryReferenceEvidence | None = None
     permitted_proposals: tuple[AgentProposalPermission, ...]
 
@@ -325,6 +531,11 @@ class AgentTask(FrozenModel):
 
     @model_validator(mode="after")
     def validate_mode_context(self) -> AgentTask:
+        if self.package_name or self.package_identity:
+            identity = normalize_package_identifier(self.ecosystem, self.package_name)
+            if self.package_identity and self.package_identity != identity:
+                raise ValueError("agent task package identity does not match the package name")
+            object.__setattr__(self, "package_identity", identity)
         if self.workflow_mode == "dismissal":
             if self.request_id is None or self.dismissal_reason is None:
                 raise ValueError("dismissal tasks require request context")
@@ -337,6 +548,9 @@ class AgentTask(FrozenModel):
             raise ValueError("agent task requires permitted proposals")
         if len(set(recommendations)) != len(recommendations):
             raise ValueError("agent proposal recommendations must be unique")
+        family = analysis_family(self.ecosystem)
+        if family == "python" and "approve" in recommendations:
+            raise ValueError("Python agent tasks cannot permit approval")
         reason_codes = tuple(
             reason_code
             for permission in self.permitted_proposals
@@ -344,11 +558,80 @@ class AgentTask(FrozenModel):
         )
         if len(set(reason_codes)) != len(reason_codes):
             raise ValueError("agent proposal reason codes must belong to one recommendation")
+        target_values = tuple(target.value for target in self.import_targets)
+        if len(set(target_values)) != len(target_values):
+            raise ValueError("agent task import targets must be unique")
+        if family == "javascript_typescript" and any(
+            target.authoritative for target in self.import_targets
+        ):
+            raise ValueError("JavaScript tasks cannot declare authoritative Python targets")
+        if any(
+            target.authoritative
+            and target.provenance == "canonical_distribution"
+            and target.value != self.package_identity
+            for target in self.import_targets
+        ):
+            raise ValueError("canonical import target must match the Python package identity")
+        manifest = PurePosixPath(self.manifest_path)
+        expected_analysis_root = (
+            "" if manifest.parent == PurePosixPath(".") else manifest.parent.as_posix()
+        )
+        if self.analysis_root != expected_analysis_root:
+            raise ValueError("agent task analysis root must match the manifest directory")
+        samples = (
+            (
+                "installed instance",
+                self.installed_instance_count,
+                len(self.installed_instance_details),
+                self.installed_instance_details_truncated,
+                False,
+            ),
+            (
+                "dependency consumer",
+                self.dependency_consumer_count,
+                len(self.dependency_consumers),
+                self.dependency_consumers_truncated,
+                False,
+            ),
+            (
+                "dependency path",
+                self.dependency_path_count,
+                len(self.dependency_paths),
+                self.dependency_paths_truncated,
+                True,
+            ),
+            (
+                "manifest declaration",
+                self.manifest_declaration_count,
+                len(self.manifest_declarations),
+                self.manifest_declarations_truncated,
+                False,
+            ),
+            (
+                "dependency provenance",
+                self.dependency_provenance_count,
+                len(self.dependency_provenance),
+                self.dependency_provenance_truncated,
+                False,
+            ),
+        )
+        for name, total_count, sample_count, truncated, allows_upstream_truncation in samples:
+            if sample_count > total_count:
+                raise ValueError(f"{name} sample cannot exceed its total count")
+            if total_count > sample_count and not truncated:
+                raise ValueError(f"{name} sample truncation must be explicit")
+            if not allows_upstream_truncation and truncated and total_count == sample_count:
+                raise ValueError(f"{name} truncation is inconsistent with its total count")
         if self.repository_reference_evidence is not None:
             if not self.permits("approve", "vulnerable_symbol_unused"):
                 raise ValueError("reference evidence requires a permitted unused-symbol proposal")
             if self.repository_reference_evidence.target_identifier != self.package_name:
                 raise ValueError("reference evidence target must match the assigned package")
+        serialized_characters = len(canonical_json(self))
+        if serialized_characters > MAX_AGENT_TASK_CHARACTERS:
+            raise AgentTaskSizeError(
+                f"serialized agent task exceeds {MAX_AGENT_TASK_CHARACTERS} characters"
+            )
         return self
 
 
@@ -359,8 +642,28 @@ class RepositoryFact(FrozenModel):
     excerpt: str
 
 
+ReachabilityOperation = Literal[
+    "import_statement",
+    "import_from_statement",
+    "call_expression",
+    "call",
+]
+ReachabilityProfile = Literal["npm", "python"]
+NPM_REACHABILITY_OPERATIONS: tuple[ReachabilityOperation, ...] = (
+    "import_statement",
+    "call_expression",
+)
+PYTHON_REACHABILITY_OPERATIONS: tuple[ReachabilityOperation, ...] = (
+    "import_statement",
+    "import_from_statement",
+    "call",
+)
+
+
 class ReachabilityFinding(FrozenModel):
-    kind: Literal["import", "require", "dynamic_import", "bound_call"]
+    kind: Literal["static_import", "dynamic_import", "runtime_require", "bound_call"]
+    language: str = Field(min_length=1)
+    matched_target: str = Field(min_length=1)
     citation: RepositoryFact
     binding: str | None = None
 
@@ -368,11 +671,18 @@ class ReachabilityFinding(FrozenModel):
 class ReachabilityEvidence(FrozenModel):
     snapshot_id: str
     package_name: str
+    target_identifiers: tuple[str, ...]
+    analysis_root: str = ""
+    profile: ReachabilityProfile
     engine: Literal["ast-grep"]
     engine_version: str
     status: Literal["syntax_usage_found", "no_syntax_match", "incomplete", "unavailable"]
-    scanned_files: int = Field(ge=0)
-    scanned_bytes: int = Field(ge=0)
+    candidate_files: int = Field(ge=0)
+    staged_files: int = Field(ge=0)
+    skipped_files: int = Field(ge=0)
+    staged_bytes: int = Field(ge=0)
+    operations: tuple[ReachabilityOperation, ...]
+    completed_operations: tuple[ReachabilityOperation, ...]
     findings: tuple[ReachabilityFinding, ...] = ()
     limitations: tuple[str, ...]
 
@@ -380,25 +690,71 @@ class ReachabilityEvidence(FrozenModel):
     def validate_status(self) -> ReachabilityEvidence:
         if (self.status == "syntax_usage_found") != bool(self.findings):
             raise ValueError("reachability status and findings are inconsistent")
+        if not self.target_identifiers or len(set(self.target_identifiers)) != len(
+            self.target_identifiers
+        ):
+            raise ValueError("reachability targets must be non-empty and unique")
+        for target in self.target_identifiers:
+            validate_safe_identifier(target)
+        analysis_root = PurePosixPath(self.analysis_root)
+        if analysis_root.is_absolute() or ".." in analysis_root.parts or self.analysis_root == ".":
+            raise ValueError("reachability analysis root is unsafe")
+        if self.candidate_files != self.staged_files + self.skipped_files:
+            raise ValueError("reachability file coverage is inconsistent")
+        expected_operations = (
+            NPM_REACHABILITY_OPERATIONS if self.profile == "npm" else PYTHON_REACHABILITY_OPERATIONS
+        )
+        if self.operations != expected_operations:
+            raise ValueError("reachability operations do not match the application profile")
+        expected_completed = tuple(
+            operation for operation in self.operations if operation in self.completed_operations
+        )
+        if expected_completed != self.completed_operations:
+            raise ValueError("completed reachability operations are inconsistent")
+        if self.status == "no_syntax_match" and (
+            self.skipped_files or self.completed_operations != self.operations
+        ):
+            raise ValueError("no-match reachability evidence requires complete bounded coverage")
+        if any(finding.matched_target not in self.target_identifiers for finding in self.findings):
+            raise ValueError("reachability finding target is not bound to the evidence")
+        if any(
+            (
+                self.profile == "npm"
+                and finding.language.casefold() not in {"javascript", "jsx", "typescript", "tsx"}
+            )
+            or (
+                self.profile == "python"
+                and (finding.language.casefold() != "python" or finding.kind == "runtime_require")
+            )
+            for finding in self.findings
+        ):
+            raise ValueError("reachability finding does not match the application profile")
         return self
 
 
 class AgentFinding(FrozenModel):
-    workflow_mode: Literal["dismissal", "triage"] = "dismissal"
+    workflow_mode: Literal["dismissal", "triage"]
     correlation_id: str
     repository_id: str
-    alert_number: int
-    request_id: str | None = None
+    alert_number: int = Field(strict=True)
+    request_id: str | None
     snapshot_id: str
     policy_digest: str
     claim: str
     citations: tuple[RepositoryFact, ...]
-    uncertainty: str = ""
+    uncertainty: str
     proposed_recommendation: Literal["approve", "deny", "human_review"]
-    policy_reason_code: str = "insufficient_context"
-    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
-    insufficient_context: bool = True
-    injection_detected: bool = False
+    policy_reason_code: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    insufficient_context: bool = Field(strict=True)
+    injection_detected: bool = Field(strict=True)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def require_numeric_confidence(cls, value: object) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("confidence must be a JSON number")
+        return float(value)
 
     @model_validator(mode="after")
     def validate_mode_context(self) -> AgentFinding:
@@ -534,7 +890,7 @@ class TriageDecision(FrozenModel):
 
 
 class Report(FrozenModel):
-    report_schema_version: Literal["1.3"] = "1.3"
+    report_schema_version: Literal["3.0"] = "3.0"
     run_mode: Literal["offline_fixture", "live_ghec"]
     workflow_mode: Literal["dismissal", "triage"]
     correlation_id: str

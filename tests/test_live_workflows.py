@@ -14,6 +14,7 @@ from github_workflow_support import (
     OWNER,
     REPO,
     FakeGitHubClient,
+    make_python_tarball,
 )
 from github_workflow_support import (
     alert as _alert,
@@ -54,7 +55,10 @@ def _triage_turn(tmp_path: Path) -> ScriptedModelTurn:
     response.write_text(
         json.dumps(
             {
-                "tool_calls": [{"name": "search", "arguments": {"query": "lodash", "path": "src"}}],
+                "tool_calls": [
+                    {"name": "analyze_reachability", "arguments": {}},
+                    {"name": "search", "arguments": {"query": "lodash", "path": "src"}},
+                ],
                 "finding": {
                     "workflow_mode": "$task.workflow_mode",
                     "correlation_id": "$task.correlation_id",
@@ -94,7 +98,7 @@ async def test_live_dismissal_uses_shared_pipeline_and_attested_snapshot(
 
     report = _report(output)
     result = cast(dict[str, object], report["result"])
-    assert report["report_schema_version"] == "1.3"
+    assert report["report_schema_version"] == "3.0"
     assert report["run_mode"] == "live_ghec"
     assert report["workflow_mode"] == "dismissal"
     repository = cast(dict[str, object], report["repository"])
@@ -176,6 +180,108 @@ async def test_live_triage_uses_shared_pipeline(tmp_path: Path) -> None:
     assert result["assessment"] == "applies"
     assert result["recommended_action"] == "remediate"
     assert report["model_identity"] == "scripted-fixture"
+    assert github.calls == ["alert", "repository", "branch", "tarball", "alert"]
+
+
+@pytest.mark.parametrize(
+    ("ecosystem", "manifest_path", "files", "expected_manager"),
+    (
+        (
+            "pip",
+            "requirements.txt",
+            {"requirements.txt": b"requests==2.31.0\n"},
+            "pip",
+        ),
+        (
+            "pip",
+            "pyproject.toml",
+            {
+                "pyproject.toml": b"""
+[tool.poetry]
+name = "example"
+version = "0.1.0"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+requests = ">=2.31,<3"
+""",
+                "poetry.lock": b"""
+[[package]]
+name = "requests"
+version = "2.31.0"
+optional = false
+groups = ["main"]
+
+[metadata]
+lock-version = "2.1"
+python-versions = "^3.12"
+content-hash = "unverified"
+""",
+            },
+            "poetry",
+        ),
+        (
+            "pip",
+            "uv.lock",
+            {
+                "pyproject.toml": b"""
+[project]
+name = "example"
+version = "0.1.0"
+dependencies = ["requests>=2"]
+""",
+                "uv.lock": b"""
+version = 1
+revision = 3
+requires-python = ">=3.12"
+
+[[package]]
+name = "requests"
+version = "2.31.0"
+source = { registry = "https://pypi.org/simple" }
+""",
+            },
+            "uv",
+        ),
+    ),
+)
+async def test_live_python_triage_is_terminal_without_agent(
+    ecosystem: str,
+    manifest_path: str,
+    files: dict[str, bytes],
+    expected_manager: str,
+    tmp_path: Path,
+) -> None:
+    python_alert = _alert(
+        ecosystem=ecosystem,
+        package_name="Requests",
+        manifest_path=manifest_path,
+        vulnerable_range="<2.32.0",
+        patched_version="2.32.0",
+    )
+    github = FakeGitHubClient(
+        alerts=[python_alert, python_alert],
+        tarball=make_python_tarball(files=files),
+    )
+
+    output = await triage_live_alert(
+        github=github,
+        owner=OWNER,
+        repo=REPO,
+        alert_number=ALERT,
+        output_root=tmp_path,
+    )
+
+    report = _report(output)
+    alert = cast(dict[str, object], report["alert"])
+    result = cast(dict[str, object], report["result"])
+    evidence = json.loads((output / "evidence.json").read_text(encoding="utf-8"))
+    assert report["model_identity"] == "not_run"
+    assert alert["ecosystem"] == ecosystem
+    assert alert["package_identity"] == "requests"
+    assert result["assessment"] == "applies"
+    assert result["reason_code"] == "triage_vulnerable_applies"
+    assert evidence["dependency"]["package_manager"] == expected_manager
     assert github.calls == ["alert", "repository", "branch", "tarball", "alert"]
 
 
@@ -308,6 +414,7 @@ async def test_live_snapshot_is_deleted_after_success(
         default_branch: str,
         commit_sha: str,
         limits: Limits,
+        selected_dependency_path: str | None = None,
     ) -> RepositorySnapshot:
         destinations.append(destination)
         return original(
@@ -318,6 +425,7 @@ async def test_live_snapshot_is_deleted_after_success(
             default_branch=default_branch,
             commit_sha=commit_sha,
             limits=limits,
+            selected_dependency_path=selected_dependency_path,
         )
 
     monkeypatch.setattr(workflow_module, "extract_repository_tarball", recording_extract)
@@ -348,8 +456,9 @@ async def test_live_snapshot_is_deleted_after_failure(
         default_branch: str,
         commit_sha: str,
         limits: Limits,
+        selected_dependency_path: str | None = None,
     ) -> RepositorySnapshot:
-        del data, owner, repo, default_branch, commit_sha, limits
+        del data, owner, repo, default_branch, commit_sha, limits, selected_dependency_path
         destinations.append(destination)
         raise GitHubCollectionError("archive could not be parsed")
 
@@ -502,14 +611,17 @@ async def test_live_agentic_route_requires_copilot_credentials(tmp_path: Path) -
     assert raised.value.stage == "configuration"
 
 
-async def test_live_agentic_route_uses_snapshot_tools_and_downgrades_approval(
+async def test_live_agentic_route_uses_snapshot_tools_and_escalates(
     tmp_path: Path,
 ) -> None:
     response = tmp_path / "agent-response.json"
     response.write_text(
         json.dumps(
             {
-                "tool_calls": [{"name": "search", "arguments": {"query": "lodash", "path": "src"}}],
+                "tool_calls": [
+                    {"name": "analyze_reachability", "arguments": {}},
+                    {"name": "search", "arguments": {"query": "lodash", "path": "src"}},
+                ],
                 "finding": {
                     "workflow_mode": "$task.workflow_mode",
                     "correlation_id": "$task.correlation_id",
@@ -518,13 +630,13 @@ async def test_live_agentic_route_uses_snapshot_tools_and_downgrades_approval(
                     "request_id": "$task.request_id",
                     "snapshot_id": "$task.snapshot_id",
                     "policy_digest": "$task.policy_digest",
-                    "claim": "The vulnerable package is used by runtime code.",
+                    "claim": "The available evidence does not support a permitted conclusion.",
                     "citations": "$observations",
-                    "uncertainty": "",
-                    "proposed_recommendation": "approve",
-                    "policy_reason_code": "vulnerable_symbol_unused",
-                    "confidence": 0.95,
-                    "insufficient_context": False,
+                    "uncertainty": "The tolerable-risk request needs human review.",
+                    "proposed_recommendation": "human_review",
+                    "policy_reason_code": "insufficient_context",
+                    "confidence": 0.5,
+                    "insufficient_context": True,
                     "injection_detected": False,
                 },
             }
@@ -546,7 +658,7 @@ async def test_live_agentic_route_uses_snapshot_tools_and_downgrades_approval(
 
     result = cast(dict[str, object], _report(output)["result"])
     assert result["recommendation"] == "human_review"
-    assert result["reason_code"] == "agent_outcome_not_permitted"
+    assert result["reason_code"] == "insufficient_context"
 
 
 @pytest.mark.parametrize(

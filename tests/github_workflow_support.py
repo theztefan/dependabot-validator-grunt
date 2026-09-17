@@ -47,14 +47,22 @@ def request(*, status: str = "pending", reason: str = "no_bandwidth") -> dict[st
     }
 
 
-def alert(*, severity: str = "high") -> dict[str, object]:
-    package = {"ecosystem": "npm", "name": "lodash"}
+def alert(
+    *,
+    severity: str = "high",
+    ecosystem: str = "npm",
+    package_name: str = "lodash",
+    manifest_path: str = "package.json",
+    vulnerable_range: str = "< 4.17.21",
+    patched_version: str = "4.17.21",
+) -> dict[str, object]:
+    package = {"ecosystem": ecosystem, "name": package_name}
     return {
         "number": ALERT,
         "state": "open",
         "dependency": {
             "package": package,
-            "manifest_path": "package.json",
+            "manifest_path": manifest_path,
             "scope": "runtime",
         },
         "security_advisory": {
@@ -70,8 +78,8 @@ def alert(*, severity: str = "high") -> dict[str, object]:
         "security_vulnerability": {
             "package": package,
             "severity": severity,
-            "vulnerable_version_range": "< 4.17.21",
-            "first_patched_version": {"identifier": "4.17.21"},
+            "vulnerable_version_range": vulnerable_range,
+            "first_patched_version": {"identifier": patched_version},
         },
     }
 
@@ -99,6 +107,19 @@ def make_tarball(*, package_version: str | None = "4.17.20") -> bytes:
         archive.addfile(root)
         for name, content in files.items():
             member = tarfile.TarInfo(name)
+            member.size = len(content)
+            archive.addfile(member, io.BytesIO(content))
+    return buffer.getvalue()
+
+
+def make_python_tarball(*, files: dict[str, bytes]) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        root = tarfile.TarInfo("root")
+        root.type = tarfile.DIRTYPE
+        archive.addfile(root)
+        for path, content in files.items():
+            member = tarfile.TarInfo(f"root/{path}")
             member.size = len(content)
             archive.addfile(member, io.BytesIO(content))
     return buffer.getvalue()

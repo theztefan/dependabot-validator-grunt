@@ -13,13 +13,24 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, TypeAdapter
 
-from dependabot_validator_grunt.models import AgentTask, canonical_json
+from dependabot_validator_grunt.agent_capabilities import (
+    INVESTIGATOR_AGENT_MANIFEST_ASSET,
+    INVESTIGATOR_AGENT_NAME,
+    INVESTIGATOR_ROLE_PROMPT_ASSET,
+    InvestigatorCapability,
+)
+from dependabot_validator_grunt.models import (
+    MAX_AGENT_TASK_CHARACTERS,
+    AgentTask,
+    canonical_json,
+)
 
-AGENT_MANIFEST_ASSET = "agents/dependency-risk-investigator/agent.json"
-AGENT_PROMPT_ASSET = "agents/dependency-risk-investigator/prompt.md"
+AGENT_MANIFEST_ASSET = INVESTIGATOR_AGENT_MANIFEST_ASSET
+AGENT_PROMPT_ASSET = INVESTIGATOR_ROLE_PROMPT_ASSET
 SYSTEM_PROMPT_ASSET = "system-prompts/dependency-risk-session.md"
 PROMPT_TEMPLATE_ASSET = "prompts/dependency-investigation.md.tmpl"
-SKILL_ASSET = "skills/dependency-risk-analysis/SKILL.md"
+JAVASCRIPT_TYPESCRIPT_SKILL_ASSET = "skills/javascript-typescript-dependency-risk-analysis/SKILL.md"
+PYTHON_SKILL_ASSET = "skills/python-dependency-risk-analysis/SKILL.md"
 JUDGE_AGENT_MANIFEST_ASSET = "agents/dependency-risk-judge/agent.json"
 JUDGE_AGENT_PROMPT_ASSET = "agents/dependency-risk-judge/prompt.md"
 JUDGE_SYSTEM_PROMPT_ASSET = "system-prompts/dependency-risk-judge.md"
@@ -31,11 +42,13 @@ TASK_PLACEHOLDER = "{{task_json}}"
 JUDGE_PLACEHOLDER = "{{judge_json}}"
 TOOL_NAMES = ("list_files", "read_file", "search", "analyze_reachability")
 JUDGE_TOOL_NAMES: tuple[str, ...] = ()
-SKILL_NAME = "dependency-risk-analysis"
+JAVASCRIPT_TYPESCRIPT_SKILL_NAME = "javascript-typescript-dependency-risk-analysis"
+PYTHON_SKILL_NAME = "python-dependency-risk-analysis"
 JUDGE_SKILL_NAME = "dependency-risk-review"
-AGENT_NAME = "dependency-risk-investigator"
+AGENT_NAME = INVESTIGATOR_AGENT_NAME
 JUDGE_AGENT_NAME = "dependency-risk-judge"
 MAX_STATIC_INSTRUCTION_CHARACTERS = 8_192
+MAX_RENDERED_TASK_PROMPT_CHARACTERS = 25_000
 _TASK_BLOCK = re.compile(r"```json\n(?P<task>.*?)\n```", re.DOTALL)
 
 
@@ -87,9 +100,6 @@ class CopilotRoleAssets(BaseModel):
     skill_asset: str
     skill_name: str
     static_instruction_characters: int
-
-
-CopilotAssets = CopilotRoleAssets
 
 
 def package_resource(relative_path: str) -> Traversable:
@@ -162,6 +172,7 @@ def _load_role_assets(
     prompt_placeholder_name: str,
     skill_asset: str,
     expected_skill_name: str,
+    expected_manifest_skill_names: tuple[str, ...] | None = None,
     expected_tool_names: tuple[str, ...],
     include_repository_tools: bool,
 ) -> CopilotRoleAssets:
@@ -172,7 +183,13 @@ def _load_role_assets(
         tool_collection = ToolDefinitions.model_validate(
             _load_json_asset(TOOL_DEFINITIONS_ASSET, ToolDefinitions)
         )
-        tool_definitions = tool_collection.tools
+        definitions_by_name = {tool.name: tool for tool in tool_collection.tools}
+        try:
+            tool_definitions = tuple(definitions_by_name[name] for name in expected_tool_names)
+        except KeyError as error:
+            raise CopilotConfigurationError(
+                "Copilot tool definitions are missing an expected tool"
+            ) from error
         declared_tool_names = tuple(tool.name for tool in tool_definitions)
     agent_prompt = read_package_asset(agent.prompt_asset)
     system_prompt = read_package_asset(system_prompt_asset)
@@ -191,7 +208,12 @@ def _load_role_assets(
         raise CopilotConfigurationError("Copilot custom-agent prompt asset is invalid")
     if agent.infer:
         raise CopilotConfigurationError("Copilot custom-agent inference must be disabled")
-    if agent.skills != (expected_skill_name,):
+    manifest_skill_names = (
+        (expected_skill_name,)
+        if expected_manifest_skill_names is None
+        else expected_manifest_skill_names
+    )
+    if agent.skills != manifest_skill_names:
         raise CopilotConfigurationError("Copilot custom-agent skill binding is invalid")
     if skill_metadata["name"] != expected_skill_name:
         raise CopilotConfigurationError("Copilot skill name is invalid")
@@ -199,12 +221,13 @@ def _load_role_assets(
         raise CopilotConfigurationError("Copilot custom-agent tool declarations do not match")
     if len(set(declared_tool_names)) != len(declared_tool_names):
         raise CopilotConfigurationError("Copilot custom-agent tool names must be unique")
+    configured_agent = agent.model_copy(update={"skills": (expected_skill_name,)})
     static_instruction_characters = _instruction_character_count(
-        agent.name,
-        agent.display_name,
-        agent.description,
-        *agent.tools,
-        *agent.skills,
+        configured_agent.name,
+        configured_agent.display_name,
+        configured_agent.description,
+        *configured_agent.tools,
+        *configured_agent.skills,
         agent_prompt,
         system_prompt,
         prompt_template,
@@ -215,7 +238,7 @@ def _load_role_assets(
         raise CopilotConfigurationError("Copilot static instructions exceed the character limit")
 
     return CopilotRoleAssets(
-        agent=agent,
+        agent=configured_agent,
         agent_prompt=agent_prompt,
         system_prompt=system_prompt,
         prompt_template=prompt_template,
@@ -226,8 +249,10 @@ def _load_role_assets(
     )
 
 
-def load_copilot_assets() -> CopilotRoleAssets:
-    """Load and validate the explicit investigator role."""
+def load_investigator_assets(
+    capability: InvestigatorCapability,
+) -> CopilotRoleAssets:
+    """Load the investigator with one validated ecosystem capability."""
     return _load_role_assets(
         manifest_asset=AGENT_MANIFEST_ASSET,
         expected_agent_name=AGENT_NAME,
@@ -236,8 +261,9 @@ def load_copilot_assets() -> CopilotRoleAssets:
         prompt_template_asset=PROMPT_TEMPLATE_ASSET,
         prompt_placeholder=TASK_PLACEHOLDER,
         prompt_placeholder_name="task_json",
-        skill_asset=SKILL_ASSET,
-        expected_skill_name=SKILL_NAME,
+        skill_asset=capability.skill_asset,
+        expected_skill_name=capability.skill_name,
+        expected_manifest_skill_names=(),
         expected_tool_names=TOOL_NAMES,
         include_repository_tools=True,
     )
@@ -262,7 +288,12 @@ def load_judge_assets() -> CopilotRoleAssets:
 
 def render_task_prompt(template: str, task: AgentTask) -> str:
     """Render a dispatch prompt and round-trip its fenced task."""
-    rendered = template.replace(TASK_PLACEHOLDER, canonical_json(task))
+    task_json = canonical_json(task)
+    if len(task_json) > MAX_AGENT_TASK_CHARACTERS:
+        raise CopilotConfigurationError("Copilot task exceeds the character limit")
+    rendered = template.replace(TASK_PLACEHOLDER, task_json)
+    if len(rendered) > MAX_RENDERED_TASK_PROMPT_CHARACTERS:
+        raise CopilotConfigurationError("Copilot rendered prompt exceeds the character limit")
     matches = tuple(_TASK_BLOCK.finditer(rendered))
     if len(matches) != 1:
         raise CopilotConfigurationError("Copilot prompt rendered an invalid task block")
@@ -282,10 +313,14 @@ def render_task_prompt(template: str, task: AgentTask) -> str:
 @contextmanager
 def materialized_skill_root(
     destination: Path,
-    skill_name: str = SKILL_NAME,
+    skill_name: str = JAVASCRIPT_TYPESCRIPT_SKILL_NAME,
 ) -> Generator[Path]:
     """Materialize one explicit packaged skill under the isolated state directory."""
-    if skill_name not in {SKILL_NAME, JUDGE_SKILL_NAME}:
+    if skill_name not in {
+        JAVASCRIPT_TYPESCRIPT_SKILL_NAME,
+        PYTHON_SKILL_NAME,
+        JUDGE_SKILL_NAME,
+    }:
         raise CopilotConfigurationError("Copilot skill selection is invalid")
     target = destination / "skills"
     selected_skill = target / skill_name

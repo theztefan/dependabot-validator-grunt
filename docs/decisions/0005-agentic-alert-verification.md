@@ -2,6 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-09-03
+- **Amends:** ADR 0003
 - **Amended by:** ADR 0006, ADR 0007, ADR 0009, and ADR 0011
 
 ## Context
@@ -30,6 +31,7 @@ when the boundary runs.
 
 - Both workflows can use repository-backed evidence without granting shell,
   network, write, or GitHub tools.
-- Agent findings remain proposals; Python owns final authority.
+- Agent findings remain proposals; deterministic application code owns final
+  authority.
 - Path controls and immutable snapshots are part of the feature, not optional
   hardening.

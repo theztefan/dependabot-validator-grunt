@@ -11,13 +11,44 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 import dependabot_validator_grunt.workflow as workflow_module
 from dependabot_validator_grunt.agentic import RepositoryTools, path_is_denied
 from dependabot_validator_grunt.copilot import ScriptedModelTurn
+from dependabot_validator_grunt.copilot_tools import analyze_task_reachability
+from dependabot_validator_grunt.deterministic import create_triage_agent_task, reconcile_triage
 from dependabot_validator_grunt.github import extract_repository_tarball
-from dependabot_validator_grunt.models import AgentTask, RepositoryReferenceEvidence
+from dependabot_validator_grunt.models import (
+    AGENT_TASK_DECLARATION_SAMPLE_LIMIT,
+    AGENT_TASK_DEPENDENCY_CONSUMER_SAMPLE_LIMIT,
+    AGENT_TASK_DEPENDENCY_PATH_SAMPLE_LIMIT,
+    AGENT_TASK_INSTALLED_INSTANCE_SAMPLE_LIMIT,
+    AGENT_TASK_PROVENANCE_SAMPLE_LIMIT,
+    MAX_AGENT_TASK_CHARACTERS,
+    PYTHON_REACHABILITY_OPERATIONS,
+    AgentFinding,
+    AgentProposalPermission,
+    AgentTask,
+    AgentTaskSizeError,
+    AlertSnapshot,
+    DependencyDeclaration,
+    DependencyEvidence,
+    DependencyInstance,
+    DependencyPath,
+    DependencyPathNode,
+    DependencyProvenance,
+    EvidenceBundle,
+    EvidenceItem,
+    ImportTarget,
+    ReachabilityEvidence,
+    ReachabilityFinding,
+    RepositoryFact,
+    RepositoryReferenceEvidence,
+    RepositorySnapshot,
+    TriageDecision,
+    canonical_json,
+)
 from dependabot_validator_grunt.policy import load_policy
 from dependabot_validator_grunt.workflow import (
     WorkflowError,
@@ -48,7 +79,10 @@ def _response(
     uncertainty: str | None = None,
 ) -> dict[str, object]:
     return {
-        "tool_calls": [{"name": "search", "arguments": {"query": "lodash", "path": "."}}],
+        "tool_calls": [
+            {"name": "analyze_reachability", "arguments": {}},
+            {"name": "search", "arguments": {"query": "lodash", "path": "."}},
+        ],
         "finding": {
             "workflow_mode": "$task.workflow_mode",
             "correlation_id": "$task.correlation_id",
@@ -77,6 +111,26 @@ def _read_report(output: Path) -> dict[str, object]:
     return json.loads((output / "report.json").read_text(encoding="utf-8"))
 
 
+def _finding_payload(task: AgentTask) -> dict[str, object]:
+    return {
+        "workflow_mode": task.workflow_mode,
+        "correlation_id": task.correlation_id,
+        "repository_id": task.repository_id,
+        "alert_number": task.alert_number,
+        "request_id": task.request_id,
+        "snapshot_id": task.snapshot_id,
+        "policy_digest": task.policy_digest,
+        "claim": "The bounded evidence is inconclusive.",
+        "citations": [],
+        "uncertainty": "More evidence is required.",
+        "proposed_recommendation": "human_review",
+        "policy_reason_code": "insufficient_context",
+        "confidence": 0.5,
+        "insufficient_context": True,
+        "injection_detected": False,
+    }
+
+
 class ArtifactInspectingTurn:
     identity = "artifact-inspecting"
 
@@ -92,7 +146,8 @@ class ArtifactInspectingTurn:
         max_attempts: int,
         wall_clock_seconds: int,
     ) -> dict[str, object]:
-        del tools, max_attempts, wall_clock_seconds
+        del max_attempts, wall_clock_seconds
+        analyze_task_reachability(tools, task)
         evidence_paths = list(self.output_root.rglob("repository-reference-evidence.json"))
         task_paths = list(self.output_root.rglob("agent-task.json"))
         assert len(evidence_paths) == len(task_paths) == 1
@@ -139,6 +194,71 @@ class ArtifactInspectingTurn:
                 "injection_detected": False,
             }
         }
+
+
+class AnalyzerBypassingTurn:
+    identity = "analyzer-bypassing"
+
+    async def run(
+        self,
+        task: AgentTask,
+        tools: RepositoryTools,
+        *,
+        max_attempts: int,
+        wall_clock_seconds: int,
+    ) -> dict[str, object]:
+        del tools, max_attempts, wall_clock_seconds
+        return {
+            "finding": {
+                "workflow_mode": task.workflow_mode,
+                "correlation_id": task.correlation_id,
+                "repository_id": task.repository_id,
+                "alert_number": task.alert_number,
+                "request_id": task.request_id,
+                "snapshot_id": task.snapshot_id,
+                "policy_digest": task.policy_digest,
+                "claim": "The task remains inconclusive.",
+                "citations": [],
+                "uncertainty": "Repository analysis was not performed.",
+                "proposed_recommendation": "human_review",
+                "policy_reason_code": "insufficient_context",
+                "confidence": 0.5,
+                "insufficient_context": True,
+                "injection_detected": False,
+            }
+        }
+
+
+@pytest.mark.parametrize("scripted", [False, True])
+async def test_workflow_rejects_model_turn_that_omits_required_analyzer(
+    scripted: bool,
+    tmp_path: Path,
+) -> None:
+    model_turn: AnalyzerBypassingTurn | ScriptedModelTurn
+    if scripted:
+        response = _response(
+            "human_review",
+            "insufficient_context",
+            insufficient_context=True,
+        )
+        response["tool_calls"] = []
+        response_path = tmp_path / "response.json"
+        response_path.write_text(json.dumps(response), encoding="utf-8")
+        model_turn = ScriptedModelTurn(response_path)
+    else:
+        model_turn = AnalyzerBypassingTurn()
+
+    with pytest.raises(WorkflowError) as raised:
+        await review_offline_fixture(
+            CASES / "tolerable-risk",
+            tmp_path / "out",
+            model_turn=model_turn,
+        )
+
+    assert raised.value.exit_code == 6
+    assert raised.value.stage == "agentic"
+    assert raised.value.__cause__ is not None
+    assert str(raised.value.__cause__) == "required reachability analysis was not invoked"
 
 
 async def test_dismissal_agent_receives_deterministic_decision_context(
@@ -192,6 +312,377 @@ async def test_agent_task_truncates_justification_without_normalizing(
     task = json.loads((output / "agent-task.json").read_text(encoding="utf-8"))
 
     assert task["justification"] == justification[:4000]
+
+
+def test_agent_finding_requires_every_response_contract_field() -> None:
+    task = AgentTask(
+        workflow_mode="triage",
+        correlation_id="correlation",
+        repository_id="owner/repository",
+        alert_number=7,
+        request_id=None,
+        snapshot_id="snapshot",
+        policy_digest="policy",
+        permitted_proposals=(
+            AgentProposalPermission(
+                recommendation="human_review",
+                reason_codes=("insufficient_context",),
+            ),
+        ),
+    )
+    required_fields = {
+        "workflow_mode",
+        "request_id",
+        "uncertainty",
+        "policy_reason_code",
+        "confidence",
+        "insufficient_context",
+        "injection_detected",
+    }
+    payload = _finding_payload(task)
+
+    for field_name in required_fields:
+        with pytest.raises(ValidationError):
+            AgentFinding.model_validate(
+                {key: value for key, value in payload.items() if key != field_name}
+            )
+
+    dismissal_payload = {
+        **payload,
+        "workflow_mode": "dismissal",
+        "request_id": None,
+    }
+    with pytest.raises(ValidationError, match="dismissal findings require"):
+        AgentFinding.model_validate(dismissal_payload)
+    with pytest.raises(ValidationError, match="triage findings cannot"):
+        AgentFinding.model_validate({**payload, "request_id": "unexpected-request"})
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("alert_number", True),
+        ("alert_number", "7"),
+        ("confidence", "0.5"),
+        ("confidence", False),
+        ("insufficient_context", "false"),
+        ("injection_detected", 0),
+    ],
+)
+def test_agent_finding_rejects_coerced_response_primitives(
+    field_name: str,
+    invalid_value: object,
+) -> None:
+    task = AgentTask(
+        workflow_mode="triage",
+        correlation_id="correlation",
+        repository_id="owner/repository",
+        alert_number=7,
+        request_id=None,
+        snapshot_id="snapshot",
+        policy_digest="policy",
+        permitted_proposals=(
+            AgentProposalPermission(
+                recommendation="human_review",
+                reason_codes=("insufficient_context",),
+            ),
+        ),
+    )
+
+    with pytest.raises(ValidationError):
+        AgentFinding.model_validate(
+            {
+                **_finding_payload(task),
+                field_name: invalid_value,
+            }
+        )
+
+
+def test_agent_task_deterministically_bounds_model_facing_collections() -> None:
+    total = (
+        max(
+            AGENT_TASK_INSTALLED_INSTANCE_SAMPLE_LIMIT,
+            AGENT_TASK_DEPENDENCY_CONSUMER_SAMPLE_LIMIT,
+            AGENT_TASK_DEPENDENCY_PATH_SAMPLE_LIMIT,
+            AGENT_TASK_DECLARATION_SAMPLE_LIMIT,
+            AGENT_TASK_PROVENANCE_SAMPLE_LIMIT,
+        )
+        + 1
+    )
+    instances = tuple(
+        DependencyInstance(
+            path=f"site-packages/requests-{index}",
+            version="2.31.0",
+            relationship="direct",
+            comparable=True,
+            source_kind="registry",
+        )
+        for index in range(total)
+    )
+    consumers = tuple(f"consumer-{index}" for index in range(total))
+    paths = tuple(
+        DependencyPath(
+            nodes=(
+                DependencyPathNode(
+                    instance_id=f"project-{index}",
+                    package_name="<project>",
+                ),
+                DependencyPathNode(
+                    instance_id=f"requests-{index}",
+                    package_name="requests",
+                    version="2.31.0",
+                ),
+            ),
+            edge_kinds=("runtime",),
+            edge_requirements=(">=2",),
+            conditions=(None,),
+        )
+        for index in range(total)
+    )
+    declarations = tuple(
+        DependencyDeclaration(
+            manifest_path=f"requirements-{index}.txt",
+            name="requests",
+            spec="==2.31.0",
+            relationship="direct",
+            exact_version="2.31.0",
+        )
+        for index in range(total)
+    )
+    provenance = tuple(
+        DependencyProvenance(
+            kind="pip_compile_via",
+            source_path=f"requirements-{index}.txt",
+            line=1,
+            target=f"parent-{index}",
+        )
+        for index in range(total)
+    )
+    policy = load_policy()
+    bundle = EvidenceBundle(
+        run_mode="offline_fixture",
+        workflow_mode="triage",
+        correlation_id="correlation",
+        alert=AlertSnapshot(
+            alert_number=7,
+            advisory_id="GHSA-test",
+            summary="Synthetic advisory.",
+            severity="high",
+            ecosystem="pip",
+            package_name="requests",
+            vulnerable_range="<2.32.0",
+            manifest_path="requirements.txt",
+            raw_response_digest="alert-digest",
+        ),
+        repository=RepositorySnapshot(
+            owner="owner",
+            name="repository",
+            snapshot_id="snapshot",
+            provenance="offline_fixture",
+            included_paths=("requirements.txt",),
+        ),
+        dependency=DependencyEvidence(
+            ecosystem="pip",
+            package_manager="pip",
+            version_scheme="pep440",
+            lockfile_version=None,
+            package_name="requests",
+            instances=instances,
+            proof_capabilities=("resolved_instances",),
+            manifest_paths=("requirements.txt",),
+            completeness="partial",
+            declarations=declarations,
+            dependency_consumers=consumers,
+            dependency_paths=paths,
+            dependency_provenance=provenance,
+        ),
+        evidence_items=(),
+        policy=policy.identity(),
+        digest="bundle-digest",
+    )
+
+    task = create_triage_agent_task(bundle, policy)
+
+    assert "installed_instances" not in task.model_dump(mode="json")
+    assert task.installed_instance_count == total
+    assert len(task.installed_instance_details) == AGENT_TASK_INSTALLED_INSTANCE_SAMPLE_LIMIT
+    assert task.installed_instance_details_truncated
+    assert task.dependency_consumer_count == total
+    assert len(task.dependency_consumers) == AGENT_TASK_DEPENDENCY_CONSUMER_SAMPLE_LIMIT
+    assert task.dependency_consumers_truncated
+    assert task.dependency_path_count == total
+    assert len(task.dependency_paths) == AGENT_TASK_DEPENDENCY_PATH_SAMPLE_LIMIT
+    assert task.dependency_paths_truncated
+    assert task.dependency_paths[0].edge_requirements == (">=2",)
+    assert task.dependency_paths[0].conditions == (None,)
+    assert task.manifest_declaration_count == total
+    assert len(task.manifest_declarations) == AGENT_TASK_DECLARATION_SAMPLE_LIMIT
+    assert task.manifest_declarations_truncated
+    assert task.dependency_provenance_count == total
+    assert len(task.dependency_provenance) == AGENT_TASK_PROVENANCE_SAMPLE_LIMIT
+    assert task.dependency_provenance_truncated
+    assert task.dependency_consumers[0] == "consumer-0"
+    assert task.dependency_consumers[-1] == (
+        f"consumer-{AGENT_TASK_DEPENDENCY_CONSUMER_SAMPLE_LIMIT - 1}"
+    )
+    assert [target.value for target in task.import_targets] == ["requests"]
+
+
+def test_advisory_python_import_target_cannot_authorize_denial() -> None:
+    policy = load_policy()
+    citation = RepositoryFact(
+        path="app.py",
+        line=1,
+        digest="digest",
+        excerpt="import requests",
+    )
+    task = AgentTask(
+        workflow_mode="triage",
+        correlation_id="correlation",
+        repository_id="owner/repository",
+        alert_number=7,
+        snapshot_id="snapshot",
+        policy_digest=policy.identity().digest,
+        ecosystem="pip",
+        package_name="requests-dist",
+        package_identity="requests-dist",
+        manifest_declaration_count=1,
+        manifest_declarations=(
+            DependencyDeclaration(
+                manifest_path="requirements.txt",
+                name="requests-dist",
+                spec=">=1",
+                relationship="direct",
+            ),
+        ),
+        import_targets=(
+            ImportTarget(
+                value="requests",
+                provenance="curated_mapping",
+                authoritative=False,
+            ),
+        ),
+        permitted_proposals=(
+            AgentProposalPermission(
+                recommendation="deny",
+                reason_codes=("advisory_applies",),
+            ),
+            AgentProposalPermission(
+                recommendation="human_review",
+                reason_codes=("insufficient_context",),
+            ),
+        ),
+    )
+    finding = AgentFinding(
+        workflow_mode="triage",
+        correlation_id=task.correlation_id,
+        repository_id=task.repository_id,
+        alert_number=task.alert_number,
+        request_id=None,
+        snapshot_id=task.snapshot_id,
+        policy_digest=task.policy_digest,
+        claim="The advisory target is imported.",
+        citations=(citation,),
+        uncertainty="",
+        proposed_recommendation="deny",
+        policy_reason_code="advisory_applies",
+        confidence=0.9,
+        insufficient_context=False,
+        injection_detected=False,
+    )
+    evidence = ReachabilityEvidence(
+        snapshot_id=task.snapshot_id,
+        package_name=task.package_name,
+        target_identifiers=("requests",),
+        profile="python",
+        engine="ast-grep",
+        engine_version="0.45.3",
+        status="syntax_usage_found",
+        candidate_files=1,
+        staged_files=1,
+        skipped_files=0,
+        staged_bytes=15,
+        operations=PYTHON_REACHABILITY_OPERATIONS,
+        completed_operations=PYTHON_REACHABILITY_OPERATIONS,
+        findings=(
+            ReachabilityFinding(
+                kind="static_import",
+                language="Python",
+                matched_target="requests",
+                citation=citation,
+                binding="requests",
+            ),
+        ),
+        limitations=("Syntactic evidence only.",),
+    )
+
+    alert = AlertSnapshot(
+        alert_number=task.alert_number,
+        advisory_id="GHSA-test",
+        summary="Synthetic advisory.",
+        severity="high",
+        ecosystem="pip",
+        package_name=task.package_name,
+        vulnerable_range="<2",
+        manifest_path="requirements.txt",
+        raw_response_digest="alert-digest",
+    )
+    bundle = EvidenceBundle(
+        run_mode="offline_fixture",
+        workflow_mode="triage",
+        correlation_id=task.correlation_id,
+        alert=alert,
+        repository=RepositorySnapshot(
+            owner="owner",
+            name="repository",
+            snapshot_id=task.snapshot_id,
+            provenance="offline_fixture",
+            included_paths=("app.py", "requirements.txt"),
+        ),
+        dependency=DependencyEvidence(
+            ecosystem="pip",
+            package_manager="pip",
+            version_scheme="pep440",
+            lockfile_version=None,
+            package_name=task.package_name,
+            instances=(),
+            manifest_paths=("requirements.txt",),
+            completeness="partial",
+            declarations=task.manifest_declarations,
+        ),
+        evidence_items=(
+            EvidenceItem(
+                evidence_id="dependency.declarations",
+                kind="dependency_declarations",
+                value="requests-dist>=1",
+                provenance="offline_fixture",
+                collector_version="test",
+                source_location="requirements.txt",
+                completeness="partial",
+            ),
+        ),
+        policy=policy.identity(),
+        digest="bundle-digest",
+    )
+    baseline = TriageDecision(
+        priority="high",
+        assessment="human_review",
+        recommended_action="investigate",
+        reason_code="triage_incomplete_evidence",
+    )
+
+    result = reconcile_triage(
+        finding,
+        task,
+        baseline,
+        bundle,
+        policy,
+        repository_reference_evidence=None,
+        reachability_evidence=evidence,
+    )
+
+    assert result.assessment == "human_review"
+    assert result.reason_code == "agent_denial_unproven"
 
 
 async def test_complete_negative_reference_evidence_can_approve_not_used(
@@ -283,7 +774,7 @@ async def test_dev_only_approval_requires_every_instance_to_be_development(
     )
 
     response = _response("approve", "dev_only_scope")
-    response["tool_calls"] = []
+    response["tool_calls"] = [{"name": "analyze_reachability", "arguments": {}}]
     finding = cast(dict[str, object], response["finding"])
     finding["citations"] = []
     (case / "agent-response.json").write_text(json.dumps(response), encoding="utf-8")
@@ -315,7 +806,7 @@ async def test_tolerable_risk_escalation_preserves_deterministic_context(
     result = cast(dict[str, object], _read_report(output)["result"])
 
     assert result["recommendation"] == "human_review"
-    assert result["reason_code"] == "agent_outcome_not_permitted"
+    assert result["reason_code"] == "insufficient_context"
     assert cast(list[dict[str, object]], result["proofs"])[0]["rule_id"] == (
         "approve_package_absent"
     )
@@ -339,6 +830,57 @@ async def test_reference_evidence_is_written_and_bound_before_model_turn(
     assert turn.observed_task.repository_reference_evidence.status == "sufficient_absence"
     assert result["recommendation"] == "approve"
     assert result["reason_code"] == "vulnerable_symbol_unused"
+
+
+async def test_reference_evidence_task_growth_is_configuration_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _copy_case("agent-approved-unused", tmp_path / "case")
+    base = AgentTask(
+        correlation_id="correlation",
+        repository_id="owner/repository",
+        alert_number=7,
+        request_id="request",
+        dismissal_reason="not_used",
+        snapshot_id="snapshot",
+        policy_digest="policy",
+        package_name="lodash",
+        permitted_proposals=(
+            AgentProposalPermission(
+                recommendation="approve",
+                reason_codes=("vulnerable_symbol_unused",),
+            ),
+            AgentProposalPermission(
+                recommendation="human_review",
+                reason_codes=("insufficient_context",),
+            ),
+        ),
+    )
+    padding = MAX_AGENT_TASK_CHARACTERS - len(canonical_json(base))
+    task = base.model_copy(update={"advisory_summary": "x" * padding})
+    assert len(canonical_json(task)) == MAX_AGENT_TASK_CHARACTERS
+
+    def oversized_task(
+        bundle: EvidenceBundle,
+        policy: object,
+    ) -> AgentTask:
+        del bundle, policy
+        return task
+
+    monkeypatch.setattr(workflow_module, "decide", oversized_task)
+
+    with pytest.raises(WorkflowError) as raised:
+        await review_offline_fixture(
+            case,
+            tmp_path / "out",
+            model_turn=AnalyzerBypassingTurn(),
+        )
+
+    assert raised.value.exit_code == 2
+    assert raised.value.stage == "configuration"
+    assert isinstance(raised.value.__cause__, AgentTaskSizeError)
+    assert "serialized agent task exceeds" in str(raised.value)
 
 
 @pytest.mark.parametrize(
@@ -514,7 +1056,7 @@ async def test_triage_unused_approval_preserves_unresolved_baseline_on_reference
 ) -> None:
     case = _copy_case("triage-vulnerable", tmp_path / reference_status)
     response = _response("approve", "vulnerable_symbol_unused")
-    response["tool_calls"] = []
+    response["tool_calls"] = [{"name": "analyze_reachability", "arguments": {}}]
     (case / "agent-response.json").write_text(json.dumps(response), encoding="utf-8")
     if reference_status == "reference_found":
         (case / "repository" / "usage.custom").write_text(
@@ -608,12 +1150,24 @@ async def test_nonblocking_uncertainty_text_does_not_override_complete_proof(
     assert result["recommendation"] == "approve"
 
 
-async def test_injection_precedes_outcome_permission_checks(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("blocker", "reason_code"),
+    [
+        ("injection_detected", "injection_detected"),
+        ("insufficient_context", "insufficient_context"),
+    ],
+)
+async def test_blockers_precede_outcome_permission_checks(
+    blocker: str,
+    reason_code: str,
+    tmp_path: Path,
+) -> None:
     dismissal = _copy_case("agent-approval-downgrade", tmp_path / "dismissal")
     dismissal_response = _response(
         "approve",
         "not_a_permitted_reason",
-        injection_detected=True,
+        insufficient_context=blocker == "insufficient_context",
+        injection_detected=blocker == "injection_detected",
     )
     (dismissal / "agent-response.json").write_text(
         json.dumps(dismissal_response),
@@ -621,13 +1175,14 @@ async def test_injection_precedes_outcome_permission_checks(tmp_path: Path) -> N
     )
     dismissal_output = await review_offline_fixture(dismissal, tmp_path / "dismissal-out")
     dismissal_result = cast(dict[str, object], _read_report(dismissal_output)["result"])
-    assert dismissal_result["reason_code"] == "injection_detected"
+    assert dismissal_result["reason_code"] == reason_code
 
     triage = _copy_case("triage-vulnerable", tmp_path / "triage")
     triage_response = _response(
         "approve",
         "not_a_permitted_reason",
-        injection_detected=True,
+        insufficient_context=blocker == "insufficient_context",
+        injection_detected=blocker == "injection_detected",
     )
     (triage / "agent-response.json").write_text(
         json.dumps(triage_response),
@@ -635,7 +1190,7 @@ async def test_injection_precedes_outcome_permission_checks(tmp_path: Path) -> N
     )
     triage_output = await triage_offline_fixture(triage, tmp_path / "triage-out")
     triage_result = cast(dict[str, object], _read_report(triage_output)["result"])
-    assert triage_result["reason_code"] == "injection_detected"
+    assert triage_result["reason_code"] == reason_code
 
 
 async def test_agentic_triage_verifies_vulnerable_alert(tmp_path: Path) -> None:
@@ -678,12 +1233,16 @@ async def test_unresolved_triage_rejects_unproven_agent_denial(
 ) -> None:
     case = _copy_case("triage-vulnerable", tmp_path / str(insufficient_context))
     (case / "repository" / "package-lock.json").unlink()
+    alert_path = case / "alert.json"
+    alert_data = json.loads(alert_path.read_text(encoding="utf-8"))
+    alert_data["manifest_path"] = "package.json"
+    alert_path.write_text(json.dumps(alert_data), encoding="utf-8")
     response = _response(
         "deny",
         "advisory_applies",
         insufficient_context=insufficient_context,
     )
-    response["tool_calls"] = []
+    response["tool_calls"] = [{"name": "analyze_reachability", "arguments": {}}]
     finding = cast(dict[str, object], response["finding"])
     finding["citations"] = []
     (case / "agent-response.json").write_text(json.dumps(response), encoding="utf-8")
@@ -754,7 +1313,7 @@ async def test_offline_agent_required_route_needs_boundary(
     "reason_code",
     ["decommission_not_valid", "reachable_and_exploitable"],
 )
-async def test_triage_rejects_unpermitted_denial_reason_code(
+async def test_scripted_triage_rejects_unpermitted_denial_reason_code(
     reason_code: str,
     tmp_path: Path,
 ) -> None:
@@ -765,12 +1324,12 @@ async def test_triage_rejects_unpermitted_denial_reason_code(
         encoding="utf-8",
     )
 
-    output = await triage_offline_fixture(case, tmp_path / "out")
-    result = cast(dict[str, object], _read_report(output)["result"])
+    with pytest.raises(WorkflowError) as raised:
+        await triage_offline_fixture(case, tmp_path / "out")
 
-    assert result["assessment"] == "applies"
-    assert result["recommended_action"] == "investigate"
-    assert result["reason_code"] == "agent_outcome_not_permitted"
+    assert raised.value.exit_code == 6
+    assert raised.value.stage == "agentic"
+    assert not _paths(tmp_path / "out", "report.json")
 
 
 def test_github_workflows_are_evidence_but_agent_controls_are_denied() -> None:

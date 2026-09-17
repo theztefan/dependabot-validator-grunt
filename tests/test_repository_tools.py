@@ -51,6 +51,23 @@ def test_reference_evidence_rejects_same_size_file_replacement(
     assert "size_changed" in _reason_codes(evidence)
 
 
+def test_snapshot_coverage_exclusions_prevent_sufficient_absence(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "app.js").write_text("console.log('safe')\n", encoding="utf-8")
+
+    evidence = RepositoryTools(
+        root,
+        coverage_excluded_path_count=2,
+    ).collect_reference_evidence("lodash")
+
+    assert evidence.status == "insufficient"
+    assert _reason_codes(evidence) == {"snapshot_excluded_path"}
+    assert evidence.insufficiency_reasons[0].count == 2
+
+
 def test_repository_tools_reject_unsafe_paths_and_limits(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()

@@ -41,4 +41,4 @@ jobs:
           wheel="$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
           uv run --isolated --no-project --with "$wheel" dependabot-validator-grunt --version
           uv run --isolated --no-project --with "$wheel" python -c \
-            "from dependabot_validator_grunt.copilot import load_copilot_assets; load_copilot_assets()"
+            "from dependabot_validator_grunt.agent_capabilities import load_investigator_capability_catalog; from dependabot_validator_grunt.copilot_assets import load_investigator_assets; [load_investigator_assets(capability) for capability in load_investigator_capability_catalog().capabilities]"

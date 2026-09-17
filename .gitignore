@@ -17,6 +17,7 @@ dist/
 # Generated workflow artifacts at the repository root.
 /artifacts/
 /reports/
+/agent-evaluations/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

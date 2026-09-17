@@ -3,6 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-09-15
 - **Amends:** ADR 0008 and ADR 0018
+- **Amended by:** ADR 0022, ADR 0026, and ADR 0027
 
 ## Context
 

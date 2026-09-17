@@ -3,7 +3,7 @@
 The current npm-ecosystem collector supports:
 
 - root `package.json`;
-- root `package-lock.json` versions 2 and 3;
+- root `package-lock.json` versions 1, 2, and 3;
 - Yarn Classic `yarn.lock` version 1;
 - pnpm `pnpm-lock.yaml` version 9.0;
 - npm workspaces whose entries resolve through the root lockfile.
@@ -15,10 +15,11 @@ ambiguous. Lockfiles owned by npm workspace entries remain unsupported.
 
 ## Collected evidence
 
-Trusted Python records every matching installed instance and, where available:
+Trusted collection code records every matching installed instance and, where available:
 
 - version;
 - workspace, direct, development, optional, or transitive relationship;
+- explicit registry, URL, VCS, path, workspace, or unknown source provenance;
 - development-only provenance;
 - reverse dependency consumers;
 - manifest paths;
@@ -36,10 +37,20 @@ installed prereleases remain concrete versions for range comparison.
 
 Package absence is conclusive only with `complete_inventory` capability. An
 unaffected-version proof requires that capability and every resolved instance
-to be comparable and outside the vulnerable range. Yarn v1 and pnpm v9.0
-initially expose only `resolved_instances`: one concrete vulnerable version can
-prove positive applicability, while negative and development-only conclusions
-remain unavailable.
+to be comparable and outside the vulnerable range. Package-lock v1, Yarn v1,
+and pnpm v9.0 expose only `resolved_instances`: one concrete vulnerable version
+can prove positive applicability, while negative and development-only
+conclusions remain unavailable.
+
+Package-lock v1 is read as its legacy nested dependency tree. A matching
+top-level entry is classified from the sibling manifest when possible, and
+nested entries are transitive. Registry-backed exact SemVer instances can
+support positive applicability. The adapter does not claim that the legacy
+tree completely describes hoisting, consumers, workspaces, or production
+scope. Tree traversal steps, matching instances, unique consumers, and
+aggregate serialized evidence output are independently bounded. Bound
+exhaustion fails collection and never publishes ordinary authorized partial
+positive evidence.
 
 ## Completeness
 
@@ -55,6 +66,12 @@ Valid input may produce partial or unsupported evidence for cases including:
 Partial or unsupported evidence cannot produce deterministic non-applicability
 approval. Agent analysis may add repository context, but cannot replace a
 missing trusted package or version proof.
+
+Source provenance describes the lockfile record and does not grant authority.
+Supported in-repository workspace links are recorded as workspace sources.
+Recognized registry resolutions are registry sources, while external tarballs,
+VCS references, local paths, and ambiguous records remain explicitly
+classified without being promoted to registry provenance.
 
 Malformed syntax, an unsupported lockfile version, ambiguous sibling lockfiles,
 an unsafe path, invalid UTF-8, size overflow, or file drift fails the

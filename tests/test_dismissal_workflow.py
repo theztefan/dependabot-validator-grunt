@@ -10,13 +10,14 @@ from types import SimpleNamespace
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
+import dependabot_validator_grunt.dependency_files as dependency_files_module
 import dependabot_validator_grunt.reporting as reporting_module
 from dependabot_validator_grunt.agentic import RepositoryTools, validate_finding
 from dependabot_validator_grunt.models import (
     AgentProposalPermission,
     AgentTask,
-    NpmEvidence,
-    NpmInstance,
+    DependencyEvidence,
+    DependencyInstance,
     Report,
     stable_digest,
 )
@@ -110,10 +111,10 @@ async def test_demo_cases(case: str, recommendation: str, reason: str, tmp_path:
     assert result["recommendation"] == recommendation
     assert result["reason_code"] == reason
     assert report["run_mode"] == "offline_fixture"
-    assert report["report_schema_version"] == "1.3"
+    assert report["report_schema_version"] == "3.0"
     policy = report["policy"]
     assert isinstance(policy, dict)
-    assert policy["version"] == "2.0.0"
+    assert policy["version"] == "3.0.0"
     assert report["model_identity"] == (
         "scripted-fixture"
         if case in {"tolerable-risk", "agent-approval-downgrade", "agent-approved-unused"}
@@ -192,8 +193,10 @@ async def test_agentic_dismissal_writes_complete_artifact_set(tmp_path: Path) ->
         "evidence.json",
         "deterministic-decision.json",
         "agent-task.json",
+        "agent-capability.json",
         "agent-output.raw.json",
         "agent-findings.json",
+        "reachability-evidence.json",
         "report.json",
         "report.md",
     } == {path.name for path in output.iterdir()}
@@ -235,6 +238,21 @@ def test_policy_rejects_unknown_fields_rules_and_unbacked_approval() -> None:
     assert isinstance(routes, dict)
     routes["not_used"]["agent_permitted"] = ["deny", "human_review"]
     with pytest.raises(ValidationError):
+        Policy.model_validate(raw)
+
+
+def test_policy_rejects_agentic_route_without_human_review() -> None:
+    raw = load_policy().model_dump(mode="json")
+    routes = TypeAdapter(dict[str, object]).validate_python(raw["routes"])
+    not_used = TypeAdapter(dict[str, object]).validate_python(routes["not_used"])
+    not_used["agent_permitted"] = ["approve"]
+    routes["not_used"] = not_used
+    raw["routes"] = routes
+
+    with pytest.raises(
+        ValidationError,
+        match="agentic route 'not_used' must permit fail-closed human review",
+    ):
         Policy.model_validate(raw)
 
 
@@ -325,15 +343,16 @@ async def test_policy_human_review_route_uses_explicit_reason_code(tmp_path: Pat
 
 
 def test_json_artifacts_preserve_required_null_fields(tmp_path: Path) -> None:
-    evidence = NpmEvidence(
+    evidence = DependencyEvidence(
         lockfile_version=None,
         package_name="lodash",
         instances=(
-            NpmInstance(
+            DependencyInstance(
                 path="node_modules/lodash",
                 version=None,
                 relationship="unknown",
                 comparable=False,
+                source_kind="unknown",
             ),
         ),
         manifest_paths=("package-lock.json",),
@@ -343,7 +362,7 @@ def test_json_artifacts_preserve_required_null_fields(tmp_path: Path) -> None:
 
     write_json(path, evidence)
 
-    restored = NpmEvidence.model_validate(json.loads(path.read_text(encoding="utf-8")))
+    restored = DependencyEvidence.model_validate(json.loads(path.read_text(encoding="utf-8")))
     assert restored == evidence
 
 
@@ -487,7 +506,7 @@ async def test_unsupported_instance_cannot_approve(tmp_path: Path) -> None:
     response = json.loads(
         (CASES / "agent-approval-downgrade" / "agent-response.json").read_text(encoding="utf-8")
     )
-    response["tool_calls"][0]["arguments"]["path"] = "."
+    response["tool_calls"][1]["arguments"]["path"] = "."
     (case / "agent-response.json").write_text(json.dumps(response), encoding="utf-8")
     output = await review_offline_fixture(case, tmp_path / "out")
     result = _read_report(output)["result"]
@@ -495,7 +514,7 @@ async def test_unsupported_instance_cannot_approve(tmp_path: Path) -> None:
     assert result["recommendation"] != "approve"
 
 
-def test_fabricated_citation_and_identity_mismatch_are_rejected(tmp_path: Path) -> None:
+def test_citation_identity_is_strict_and_excerpt_is_canonicalized(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()
     (root / "a.txt").write_text("needle", encoding="utf-8")
@@ -520,6 +539,7 @@ def test_fabricated_citation_and_identity_mismatch_are_rejected(tmp_path: Path) 
         ),
     )
     raw: dict[str, object] = {
+        "workflow_mode": "dismissal",
         "correlation_id": "wrong",
         "repository_id": "o/r",
         "alert_number": 1,
@@ -528,7 +548,12 @@ def test_fabricated_citation_and_identity_mismatch_are_rejected(tmp_path: Path) 
         "policy_digest": "p",
         "claim": "claim",
         "citations": [{"path": "a.txt", "line": 1, "digest": "fake", "excerpt": "needle"}],
+        "uncertainty": "",
         "proposed_recommendation": "deny",
+        "policy_reason_code": "advisory_applies",
+        "confidence": 0.9,
+        "insufficient_context": False,
+        "injection_detected": False,
     }
     with pytest.raises(ValueError):
         validate_finding(raw, task, tools)
@@ -542,8 +567,60 @@ def test_fabricated_citation_and_identity_mismatch_are_rejected(tmp_path: Path) 
             "excerpt": "fabricated repository text",
         }
     ]
-    with pytest.raises(ValueError):
-        validate_finding(raw, task, tools)
+    finding = validate_finding(raw, task, tools)
+    assert finding.citations == (observed,)
+
+
+def test_human_review_drops_unvalidated_optional_citations(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    tools = RepositoryTools(root)
+    task = AgentTask(
+        correlation_id="c",
+        repository_id="o/r",
+        alert_number=1,
+        request_id="q",
+        dismissal_reason="not_used",
+        snapshot_id="s",
+        policy_digest="p",
+        permitted_proposals=(
+            AgentProposalPermission(
+                recommendation="human_review",
+                reason_codes=("insufficient_context",),
+            ),
+        ),
+    )
+
+    finding = validate_finding(
+        {
+            "workflow_mode": "dismissal",
+            "correlation_id": "c",
+            "repository_id": "o/r",
+            "alert_number": 1,
+            "request_id": "q",
+            "snapshot_id": "s",
+            "policy_digest": "p",
+            "claim": "Available evidence is inconclusive.",
+            "citations": [
+                {
+                    "path": "missing.py",
+                    "line": 1,
+                    "digest": "fabricated",
+                    "excerpt": "import example",
+                }
+            ],
+            "uncertainty": "The citation could not be validated.",
+            "proposed_recommendation": "human_review",
+            "policy_reason_code": "insufficient_context",
+            "confidence": 0.1,
+            "insufficient_context": True,
+            "injection_detected": False,
+        },
+        task,
+        tools,
+    )
+
+    assert finding.citations == ()
 
 
 async def test_invalid_policy_is_configuration_failure(tmp_path: Path) -> None:
@@ -589,7 +666,7 @@ async def test_package_absence_counterfactual_removes_approval(tmp_path: Path) -
     response = json.loads(
         (CASES / "agent-approval-downgrade" / "agent-response.json").read_text(encoding="utf-8")
     )
-    response["tool_calls"][0]["arguments"]["path"] = "."
+    response["tool_calls"][1]["arguments"]["path"] = "."
     (case / "agent-response.json").write_text(json.dumps(response), encoding="utf-8")
     output = await review_offline_fixture(case, tmp_path / "out")
     result = _read_report(output)["result"]
@@ -614,7 +691,10 @@ async def test_markdown_fences_untrusted_text(tmp_path: Path) -> None:
 
 async def test_malformed_agent_output_preserves_failure(tmp_path: Path) -> None:
     case = _copy_case("tolerable-risk", tmp_path / "case")
-    (case / "agent-response.json").write_text('{"finding": "invalid"}', encoding="utf-8")
+    (case / "agent-response.json").write_text(
+        '{"tool_calls":[{"name":"analyze_reachability","arguments":{}}],"finding":"invalid"}',
+        encoding="utf-8",
+    )
     with pytest.raises(WorkflowError) as raised:
         await review_offline_fixture(case, tmp_path / "out")
     assert raised.value.exit_code == 6
@@ -622,7 +702,10 @@ async def test_malformed_agent_output_preserves_failure(tmp_path: Path) -> None:
     assert failures
     raw_outputs = list((tmp_path / "out").rglob("agent-output.raw.json"))
     assert len(raw_outputs) == 1
-    assert json.loads(raw_outputs[0].read_text(encoding="utf-8")) == {"finding": "invalid"}
+    assert json.loads(raw_outputs[0].read_text(encoding="utf-8")) == {
+        "tool_calls": [{"name": "analyze_reachability", "arguments": {}}],
+        "finding": "invalid",
+    }
 
 
 async def test_agent_artifact_preserves_complete_raw_response(tmp_path: Path) -> None:
@@ -631,7 +714,7 @@ async def test_agent_artifact_preserves_complete_raw_response(tmp_path: Path) ->
     assert "tool_calls" in raw
     assert "finding" in raw
     report = _read_report(output)
-    assert report["collector_version"] == "offline-npm-v1"
+    assert report["collector_version"] == "offline-dependency-v2"
     assert report["model_identity"] == "scripted-fixture"
     task = json.loads((output / "agent-task.json").read_text(encoding="utf-8"))
     assert task["repository_file_count"] >= 1
@@ -643,7 +726,7 @@ async def test_agent_artifact_preserves_complete_raw_response(tmp_path: Path) ->
     ("mutation", "exit_code", "stage"),
     [
         ("missing_case", 4, "collection"),
-        ("invalid_lock", 5, "npm_evidence"),
+        ("invalid_lock", 5, "dependency_evidence"),
         ("invalid_reread", 7, "validation"),
     ],
 )
@@ -814,8 +897,41 @@ def test_root_package_manifest_without_lockfile_is_partial(tmp_path: Path) -> No
             "relationship": "direct",
             "alias_target": None,
             "exact_version": "4.17.20",
+            "marker": None,
+            "source_kind": "registry",
+            "source_locator": None,
         }
     ]
+
+
+def test_selected_npm_lockfile_must_exist_before_sibling_manifest(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    (repository / "src").mkdir(parents=True)
+
+    with pytest.raises(
+        ValueError,
+        match=r"selected npm dependency file is missing: src/package-lock\.json",
+    ):
+        collect_npm_evidence(repository, "lodash", "src/package-lock.json")
+
+
+def test_selected_npm_lockfile_requires_stable_sibling_manifest_error(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    (repository / "src").mkdir(parents=True)
+    (repository / "src" / "package-lock.json").write_text(
+        '{"lockfileVersion":3,"packages":{}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"selected npm project manifest is missing: src/package\.json",
+    ):
+        collect_npm_evidence(repository, "lodash", "src/package-lock.json")
 
 
 def test_nested_lockfile_uses_only_selected_project(tmp_path: Path) -> None:
@@ -954,22 +1070,22 @@ def test_dependency_file_reader_rejects_size_drift(
     repository.mkdir()
     manifest = repository / "package.json"
     manifest.write_text('{"dependencies":{"lodash":"4.17.20"}}', encoding="utf-8")
-    original_stat = Path.stat
+    original_fstat = dependency_files_module.os.fstat
     manifest_stats = 0
 
-    def drifting_stat(path: Path, *args: object, **kwargs: object) -> object:
+    def drifting_fstat(descriptor: int) -> object:
         nonlocal manifest_stats
-        result = original_stat(path, *args, **kwargs)
-        if path == manifest:
-            manifest_stats += 1
-            return SimpleNamespace(
-                st_mode=result.st_mode,
-                st_size=result.st_size,
-                st_mtime_ns=result.st_mtime_ns + manifest_stats,
-            )
-        return result
+        result = original_fstat(descriptor)
+        manifest_stats += 1
+        return SimpleNamespace(
+            st_dev=result.st_dev,
+            st_ino=result.st_ino,
+            st_mode=result.st_mode,
+            st_size=result.st_size,
+            st_mtime_ns=result.st_mtime_ns + manifest_stats,
+        )
 
-    monkeypatch.setattr(Path, "stat", drifting_stat)
+    monkeypatch.setattr(dependency_files_module.os, "fstat", drifting_fstat)
 
     with pytest.raises(ValueError, match="changed"):
         collect_npm_evidence(repository, "lodash", "package.json")
@@ -1028,7 +1144,14 @@ async def test_unaffected_version_counterfactual_removes_approval(tmp_path: Path
     response = json.loads(
         (CASES / "agent-approval-downgrade" / "agent-response.json").read_text(encoding="utf-8")
     )
-    response["tool_calls"][0]["arguments"]["path"] = "."
+    response["tool_calls"][1]["arguments"]["path"] = "."
+    response["finding"].update(
+        {
+            "claim": "The vulnerable installed version remains present.",
+            "proposed_recommendation": "deny",
+            "policy_reason_code": "advisory_applies",
+        }
+    )
     (case / "agent-response.json").write_text(json.dumps(response), encoding="utf-8")
     output = await review_offline_fixture(case, tmp_path / "out")
     result = _read_report(output)["result"]
@@ -1052,7 +1175,14 @@ async def test_vulnerable_nested_instance_blocks_unaffected_approval(
     response = json.loads(
         (CASES / "agent-approval-downgrade" / "agent-response.json").read_text(encoding="utf-8")
     )
-    response["tool_calls"][0]["arguments"]["path"] = "."
+    response["tool_calls"][1]["arguments"]["path"] = "."
+    response["finding"].update(
+        {
+            "claim": "A vulnerable nested installed version remains present.",
+            "proposed_recommendation": "deny",
+            "policy_reason_code": "advisory_applies",
+        }
+    )
     (case / "agent-response.json").write_text(json.dumps(response), encoding="utf-8")
     blocked = await review_offline_fixture(case, tmp_path / "blocked")
     blocked_result = _read_report(blocked)["result"]

@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-09-11
 - **Amends:** ADR 0008's creation-time asset event requirement
-- **Amended by:** ADR 0017
+- **Amended by:** ADR 0017, ADR 0026, and ADR 0027
 
 ## Context
 
@@ -23,6 +23,11 @@ until the asset timeout. Skipping runtime verification would weaken the
 fail-closed boundary.
 
 ## Decision
+
+ADR 0027 supersedes only the strict expected agent and skill event checks
+below. Those expected identity observations are diagnostic. Positively
+observed unexpected enabled skills, extra tools, agent deselection, or
+conflicting runtime identities remain configuration failures.
 
 - Make the mutable session observer identity-hashable rather than value-equal.
 - Mark only the three exact allowlisted repository tools as intentional

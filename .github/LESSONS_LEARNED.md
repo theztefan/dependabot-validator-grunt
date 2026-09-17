@@ -29,6 +29,13 @@ every change. Current behavior remains authoritative in
 - Grant proof authority by explicit capability, not successful parsing.
   Positive package instances do not imply complete inventory, consumer
   coverage, development scope, or safe negative conclusions.
+- Distinguish a lockfile-recorded candidate dependency path from an active
+  environment graph. Propagate markers, groups, optional state, sources,
+  ambiguity, cycles, and truncation across the whole path before granting any
+  positive authority.
+- Bound parser amplification as well as input bytes. Traversal states, emitted
+  records, candidate paths, and serialized evidence all need explicit limits
+  because small structured inputs can expand into large in-memory artifacts.
 - Prove non-use across both repository references and dependency consumers.
   Development-only conclusions also require compatible alert scope and
   instance provenance.
@@ -39,8 +46,8 @@ every change. Current behavior remains authoritative in
 
 ## Agent boundaries
 
-- Keep model-facing prose declarative. Python owns policy, tool behavior,
-  schemas, permissions, validation, and final decisions.
+- Keep model-facing prose declarative. Deterministic application code owns
+  policy, tool behavior, schemas, permissions, validation, and final decisions.
 - Give each attempt fresh mutable tool state and budget. Carry forward only the
   selected attempt's validated observations.
 - Verify real SDK behavior through runtime events; keep fakes aligned with
@@ -50,11 +57,36 @@ every change. Current behavior remains authoritative in
   untrusted payloads.
 - Frozen judge context must include every load-bearing predicate, and a judge
   replacement must not overwrite the primary finding it reviewed.
+- Treat SDK agent and skill inventory as diagnostics, not authorization.
+  Explicit tools, bounded handlers, deny-by-default permissions, validated
+  enabled skills, typed findings, evidence binding, and deterministic
+  reconciliation are the load-bearing controls.
+- Version ecosystem methodology as a closed application-selected capability.
+  Keep one runtime identity when permissions and response contracts are the
+  same; split skills or analyzer profiles only where semantics differ.
+- Construct optional judges lazily after primary finding and reachability
+  validation so deterministic and failed-primary routes do not depend on
+  judge assets.
 
 ## Repository evidence
 
 - Parse URLs, package identifiers, and output paths structurally; substring
   allowlists are not security boundaries.
+- A source-extension list is not an analyzer security boundary. Keep repository
+  control out through immutable staging, an application-owned configuration,
+  command-line option termination, fixed operations, resource limits, and
+  validated byte-bound citations.
+- Apply analyzer language-profile filtering before output limits. Filtering
+  only during interpretation lets irrelevant-language matches exhaust the
+  selected profile's budget and suppress relevant evidence.
+- Bind structural import rules to the complete application-selected target set
+  before output collection, and restrict generic call collection to
+  target-bearing files. Trusted interpretation remains necessary, but
+  interpretation-only filtering does not scale with unrelated imports and
+  calls.
+- Treat known distribution-to-import namespace collisions as advisory for
+  every involved distribution, including canonical same-name distributions.
+  Package presence plus an ambiguous import cannot identify the provider.
 - Bind negative evidence to immutable file identity, content digests, bounded
   no-follow reads, and a final snapshot recheck.
 - Charge distinct immutable file content once per attempt so repeated bounded

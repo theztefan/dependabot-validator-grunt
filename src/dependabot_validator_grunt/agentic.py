@@ -9,21 +9,26 @@ import re
 import stat
 import unicodedata
 from collections import Counter
+from collections.abc import Sequence
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 from pydantic import TypeAdapter, ValidationError
 
 from dependabot_validator_grunt.models import (
+    NPM_REACHABILITY_OPERATIONS,
+    PYTHON_REACHABILITY_OPERATIONS,
     AgentFinding,
     AgentTask,
     ReachabilityEvidence,
+    ReachabilityProfile,
     RepositoryFact,
     RepositoryReferenceEvidence,
     RepositoryReferenceInsufficiencyCode,
     RepositoryReferenceInsufficiencyReason,
     RepositoryReferenceStatus,
     canonical_json,
+    validate_safe_identifier,
 )
 
 if TYPE_CHECKING:
@@ -93,6 +98,7 @@ NPM_PACKAGE_DECLARATION_FIELDS = {
     "overrides",
 }
 REFERENCE_INSUFFICIENCY_ORDER: tuple[RepositoryReferenceInsufficiencyCode, ...] = (
+    "snapshot_excluded_path",
     "lstat_failed",
     "proof_budget_exceeded",
     "read_failed",
@@ -137,12 +143,15 @@ class RepositoryTools:
         max_session_bytes: int = 32 * 1024 * 1024,
         max_proof_scan_bytes: int = 64 * 1024 * 1024,
         reachability_runner: ReachabilityRunner | None = None,
-        analyzer_wall_seconds: int = 60,
-        max_analyzer_files: int = 10_000,
-        max_analyzer_input_bytes: int = 64 * 1024 * 1024,
+        analyzer_wall_seconds: int = 120,
+        max_analyzer_files: int = 20_000,
+        max_analyzer_input_bytes: int = 128 * 1024 * 1024,
+        max_analyzer_batch_files: int = 1_000,
+        max_analyzer_batch_bytes: int = 16 * 1024 * 1024,
         max_analyzer_output_bytes: int = 4 * 1024 * 1024,
         max_analyzer_stderr_bytes: int = 256 * 1024,
         max_analyzer_findings: int = 500,
+        coverage_excluded_path_count: int = 0,
     ) -> None:
         self.root = root.resolve(strict=True)
         self.max_read_bytes = max_read_bytes
@@ -153,13 +162,15 @@ class RepositoryTools:
         self.analyzer_wall_seconds = analyzer_wall_seconds
         self.max_analyzer_files = max_analyzer_files
         self.max_analyzer_input_bytes = max_analyzer_input_bytes
+        self.max_analyzer_batch_files = max_analyzer_batch_files
+        self.max_analyzer_batch_bytes = max_analyzer_batch_bytes
         self.max_analyzer_output_bytes = max_analyzer_output_bytes
         self.max_analyzer_stderr_bytes = max_analyzer_stderr_bytes
         self.max_analyzer_findings = max_analyzer_findings
+        self.coverage_excluded_path_count = coverage_excluded_path_count
         self._used_bytes = 0
         self._text_cache: dict[Path, str] = {}
         self.observations: dict[tuple[str, int, str], RepositoryFact] = {}
-        self.reachability_invoked = False
         self.reachability_invocation_count = 0
         self.reachability_evidence: ReachabilityEvidence | None = None
         self._reference_file_digests: dict[Path, bytes] = {}
@@ -169,14 +180,29 @@ class RepositoryTools:
         *,
         snapshot_id: str,
         package_name: str,
+        profile: ReachabilityProfile,
+        analysis_root: str = "",
+        target_identifiers: Sequence[str] | None = None,
     ) -> ReachabilityEvidence:
         """Run the task-bound structural analyzer and register its citations."""
-        self.reachability_invoked = True
+        if isinstance(target_identifiers, str):
+            raise ValueError("target identifiers must be a sequence of identifiers")
+        selected_targets = (
+            (package_name,) if target_identifiers is None else tuple(target_identifiers)
+        )
+        if not selected_targets:
+            raise ValueError("at least one analyzer target identifier is required")
+        targets = tuple(
+            dict.fromkeys(validate_safe_identifier(value) for value in selected_targets)
+        )
         self.reachability_invocation_count += 1
         if self.reachability_evidence is not None:
             if (
                 self.reachability_evidence.snapshot_id != snapshot_id
                 or self.reachability_evidence.package_name != package_name
+                or self.reachability_evidence.target_identifiers != targets
+                or self.reachability_evidence.profile != profile
+                or self.reachability_evidence.analysis_root != analysis_root
             ):
                 raise ValueError("cached reachability evidence identity mismatch")
             return self.reachability_evidence
@@ -184,25 +210,52 @@ class RepositoryTools:
             evidence = ReachabilityEvidence(
                 snapshot_id=snapshot_id,
                 package_name=package_name,
+                target_identifiers=targets,
+                analysis_root=analysis_root,
+                profile=profile,
                 engine="ast-grep",
                 engine_version="unavailable",
                 status="unavailable",
-                scanned_files=0,
-                scanned_bytes=0,
-                limitations=("The structural analyzer is not configured.",),
+                candidate_files=0,
+                staged_files=0,
+                skipped_files=0,
+                staged_bytes=0,
+                operations=(
+                    NPM_REACHABILITY_OPERATIONS
+                    if profile == "npm"
+                    else PYTHON_REACHABILITY_OPERATIONS
+                ),
+                completed_operations=(),
+                limitations=(
+                    "The structural analyzer is not configured.",
+                    "Analyzer unavailability is not evidence of non-reachability.",
+                ),
             )
         else:
             evidence = self.reachability_runner.analyze(
                 self.root,
                 snapshot_id=snapshot_id,
                 package_name=package_name,
+                profile=profile,
+                analysis_root=analysis_root,
+                target_identifiers=targets,
                 wall_seconds=self.analyzer_wall_seconds,
                 max_files=self.max_analyzer_files,
                 max_input_bytes=self.max_analyzer_input_bytes,
+                max_batch_files=self.max_analyzer_batch_files,
+                max_batch_bytes=self.max_analyzer_batch_bytes,
                 max_output_bytes=self.max_analyzer_output_bytes,
                 max_stderr_bytes=self.max_analyzer_stderr_bytes,
                 max_findings=self.max_analyzer_findings,
             )
+        if (
+            evidence.snapshot_id != snapshot_id
+            or evidence.package_name != package_name
+            or evidence.target_identifiers != targets
+            or evidence.profile != profile
+            or evidence.analysis_root != analysis_root
+        ):
+            raise ValueError("reachability evidence identity mismatch")
         self.reachability_evidence = evidence
         for finding in evidence.findings:
             fact = finding.citation
@@ -320,6 +373,8 @@ class RepositoryTools:
         binary_excluded_count = 0
         scanned_bytes = 0
         reason_counts: Counter[RepositoryReferenceInsufficiencyCode] = Counter()
+        if self.coverage_excluded_path_count:
+            reason_counts["snapshot_excluded_path"] = self.coverage_excluded_path_count
 
         try:
             paths = sorted(self.root.rglob("*"))
@@ -525,8 +580,23 @@ def validate_finding(
     )
     if actual != expected:
         raise ValueError("agent finding identity does not match assigned task")
+    if (
+        not finding.insufficient_context
+        and not finding.injection_detected
+        and not task.permits(
+            finding.proposed_recommendation,
+            finding.policy_reason_code,
+        )
+    ):
+        raise ValueError("agent finding recommendation and reason code are not permitted")
+    validated_citations: list[RepositoryFact] = []
     for index, citation in enumerate(finding.citations):
         observed = tools.observations.get((citation.path, citation.line, citation.digest))
-        if observed is None or citation != observed:
+        if observed is None:
+            if finding.proposed_recommendation == "human_review":
+                continue
             raise ValueError(f"fabricated or stale citation at index {index}")
+        validated_citations.append(observed)
+    if tuple(validated_citations) != finding.citations:
+        return finding.model_copy(update={"citations": tuple(validated_citations)})
     return finding

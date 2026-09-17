@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-09-04
 - **Amends:** ADR 0005
-- **Amended by:** ADR 0007
+- **Superseded by:** ADR 0007's temporary trust in agent-assessed semantics
 
 ## Context
 
@@ -16,7 +16,7 @@ predicate that Python could re-prove.
 - Keep policy rule IDs internal and map final results to stable public reason
   codes.
 - Bind each dismissal reason to explicit permitted recommendation/code pairs.
-- Keep fail-closed `human_review` available for every agentic route.
+- Keep fail-closed `human_review` available for every investigator route.
 - Use a committed test manifest to distinguish decision criteria from scripted
   fixture scenarios.
 - Reject external policy that introduces noncanonical reasons, removes required

@@ -51,7 +51,7 @@ class _ForbiddenJudge:
 
 
 def _forbidden_agentic_boundary() -> JudgedModelTurn:
-    return JudgedModelTurn(_ForbiddenPrimary(), _ForbiddenJudge())
+    return JudgedModelTurn(_ForbiddenPrimary(), lambda: _ForbiddenJudge())
 
 
 def _read_json(path: Path) -> dict[str, object]:

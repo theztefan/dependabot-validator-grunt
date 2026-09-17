@@ -4,6 +4,7 @@ const topics = [
     ["flows", "Full flows"],
     ["architecture", "Architecture"],
     ["customize", "Customize"],
+    ["evaluation", "Evaluate agents"],
     ["safety", "Safety model"],
     ["change", "Make changes"],
 ];
@@ -11,10 +12,10 @@ const topics = [
 export const topicSummaries = {
     overview: {
         purpose:
-            "Review one Dependabot dismissal request or triage one alert using deterministic npm evidence plus bounded Copilot investigation.",
+            "Review one Dependabot dismissal request or triage one alert using deterministic dependency evidence plus a bounded investigator with an application-selected ecosystem capability.",
         remember: [
             "The CLI is read-only and publishes local report.json and report.md files only.",
-            "Deterministic Python owns every final decision.",
+            "Deterministic application code owns every final decision.",
             "Agent output is untrusted evidence, never authority.",
         ],
         files: ["README.md", "docs/README.md", "docs/architecture.md"],
@@ -25,6 +26,7 @@ export const topicSummaries = {
             "uv run python -m copilot download-runtime",
             "uv run dependabot-validator-grunt review-dismissal --offline-fixture examples/offline-cases/not-used-absent",
             "uv run dependabot-validator-grunt triage-alert --offline-fixture examples/offline-cases/triage-vulnerable",
+            "uv run dependabot-validator-grunt evaluate-agent-capabilities --manifest examples/offline-cases/capability-evaluation.json",
         ],
         credentials: ["DEPENDABOT_GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN"],
         remember: ["Offline fixtures are the default credential-free development path."],
@@ -32,9 +34,9 @@ export const topicSummaries = {
     flows: {
         useCases: [
             "Offline dismissal review",
-            "Live GHEC dismissal review",
+            "Live GitHub Enterprise Cloud dismissal review",
             "Offline alert triage",
-            "Live GHEC alert triage",
+            "Live GitHub Enterprise Cloud alert triage",
         ],
         sharedInvariant:
             "Every successful path ends with deterministic validation and atomic local report publication.",
@@ -57,13 +59,27 @@ export const topicSummaries = {
             "models.py",
             "github.py",
             "npm.py",
+            "python_dependencies.py",
+            "pip_dependencies.py",
+            "poetry_dependencies.py",
+            "uv_dependencies.py",
+            "unsupported_python_dependencies.py",
+            "python_dependency_common.py",
+            "dependency_files.py",
+            "dependency.py",
             "dependency_graph.py",
+            "python_imports.py",
             "yarn.py",
             "pnpm.py",
             "policy.py",
             "deterministic.py",
+            "agent_capabilities.py",
+            "agent_evaluation.py",
             "agentic.py",
             "reachability.py",
+            "reachability_ast_grep.py",
+            "reachability_npm.py",
+            "reachability_python.py",
             "copilot.py",
             "judge.py",
             "copilot_assets.py",
@@ -75,7 +91,10 @@ export const topicSummaries = {
         ownership: {
             policy: "src/dependabot_validator_grunt/policies/default.json",
             engine: "src/dependabot_validator_grunt/deterministic.py",
+            capabilityCatalog:
+                "src/dependabot_validator_grunt/agents/investigator-capabilities.json",
             agent: "src/dependabot_validator_grunt/agents/dependency-risk-investigator/",
+            evaluation: "src/dependabot_validator_grunt/agent_evaluation.py",
             judgeAgent: "src/dependabot_validator_grunt/agents/dependency-risk-judge/",
             sessionSafety:
                 "src/dependabot_validator_grunt/system-prompts/",
@@ -87,13 +106,32 @@ export const topicSummaries = {
         },
         remember: ["Change the smallest file that owns the behavior."],
     },
+    evaluation: {
+        command:
+            "uv run dependabot-validator-grunt evaluate-agent-capabilities --manifest examples/offline-cases/capability-evaluation.json",
+        output:
+            "agent-evaluations/<evaluation-id>/evaluation.json plus isolated case workflow artifacts",
+        evaluates: [
+            "the current investigator with the npm or Python capability selected by each task",
+            "scripted fixture responses by default, or a real model with --model",
+        ],
+        remember: [
+            "Evaluation is local and authoritative: false; promotion requires a reviewed code/configuration change.",
+            "Exit 9 means a manifest, execution, validation, expectation, or publication failure.",
+        ],
+        files: [
+            "docs/reference/agent-capabilities.md",
+            "src/dependabot_validator_grunt/agent_evaluation.py",
+            "src/dependabot_validator_grunt/agent_capabilities.py",
+        ],
+    },
     safety: {
         controls: [
             "CopilotClient(mode=\"empty\")",
             "exact tool allowlist: list_files, read_file, search, analyze_reachability",
             "deny-by-default permission handler",
             "separate GitHub and Copilot credential roles and constructor paths",
-            "exact custom-agent and custom-skill load-event validation",
+            "identity inventory diagnostics plus fatal observed tool, enabled-skill, deselection, and conflicting-agent expansion",
             "schema validation and deterministic reconciliation before publication",
         ],
     },
@@ -139,10 +177,10 @@ const applicationFlows = [
                     "Validate request.json, alert.json, repository files, and policy precedence: CLI file, fixture policy.json, then packaged default.",
             },
             {
-                title: "Build typed npm evidence",
-                owner: "npm.py · models.py",
+                title: "Build typed dependency evidence",
+                owner: "workflow.py · npm.py · python_dependencies.py · concrete Python collectors · models.py",
                 detail:
-                    "Inspect package-lock v2/v3, Yarn Classic v1, pnpm v9.0, or partial manifest-only evidence without executing repository code; create the canonical EvidenceBundle and write input/evidence artifacts.",
+                    "Inspect the selected npm, Yarn, pnpm, pip, Poetry, or uv input without executing repository code; record bounded Poetry/uv candidate paths and separate pip provenance where available; create the version 3.0 EvidenceBundle and write input/evidence artifacts.",
             },
             {
                 title: "Check request lifecycle",
@@ -165,7 +203,7 @@ const applicationFlows = [
                 title: "Run deterministic dismissal rules",
                 owner: "deterministic.py",
                 detail:
-                    "Apply policy routes and closed npm proofs. The result is either a final DismissalDecision or a typed AgentTask.",
+                    "Apply policy routes and authorized dependency proofs. Python evidence remains positive-only; configured inconclusive npm or Python dismissal routes may produce an ecosystem-specific version 3.0 AgentTask.",
                 branches: [
                     {
                         label: "Final decision",
@@ -264,12 +302,12 @@ const applicationFlows = [
     },
     {
         id: "live-dismissal",
-        title: "Live GHEC dismissal review",
+        title: "Live GitHub Enterprise Cloud dismissal review",
         subtitle:
             "Read a current dismissal request, use immutable repository evidence when needed, and never write back to GitHub.",
         command:
-            "DEPENDABOT_GITHUB_TOKEN=<token> uv run dependabot-validator-grunt review-dismissal --request <request-url>",
-        labels: ["live_ghec", "dismissal", "credential roles"],
+            "uv run dependabot-validator-grunt review-dismissal --request <request-url>",
+        labels: ["live GitHub", "dismissal", "credential roles"],
         stages: [
             {
                 title: "Validate target, policy, and credentials",
@@ -292,18 +330,18 @@ const applicationFlows = [
                     {
                         label: "Not pending or expired",
                         result:
-                            "Fetch alert, repository, branch, and commit metadata only; skip tarball, npm evidence, Copilot, drift re-fetch, and route validation, then publish the lifecycle result.",
+                            "Fetch alert, repository, branch, and commit metadata only; skip tarball, dependency evidence, Copilot, drift re-fetch, and route validation, then publish the lifecycle result.",
                         tone: "safe",
                     },
                     {
                         label: "Pending",
-                        result: "Fetch alert/repository/branch, download the commit-pinned tarball, and safely extract the snapshot.",
+                        result: "Fetch alert/repository/branch, download the commit-pinned tarball, and safely extract a portable snapshot. Ordinary oversized or normalized-colliding paths are recorded as incomplete coverage; selected dependency collisions still fail.",
                     },
                 ],
             },
             {
-                title: "Collect npm evidence for pending requests",
-                owner: "github.py · npm.py · models.py",
+                title: "Collect dependency evidence for pending requests",
+                owner: "github.py · workflow.py · npm.py · python_dependencies.py · concrete Python collectors · models.py",
                 detail:
                     "Inspect the immutable snapshot, record included/excluded paths, and collect dependency instances. Every path, including terminal lifecycle, still writes input/evidence artifacts and a typed bundle.",
                 optional: true,
@@ -420,8 +458,8 @@ const applicationFlows = [
                     "Reject live --repo/--alert inputs mixed with a fixture. --model explicitly selects real Copilot and requires its credential.",
             },
             {
-                title: "Load fixture, policy, snapshot, and npm evidence",
-                owner: "workflow.py · policy.py · npm.py",
+                title: "Load fixture, policy, snapshot, and dependency evidence",
+                owner: "workflow.py · policy.py · npm.py · python_dependencies.py · concrete Python collectors",
                 detail:
                     "Build one typed EvidenceBundle and write input.json plus evidence.json before reasoning.",
             },
@@ -435,11 +473,11 @@ const applicationFlows = [
                 title: "Decide whether agent refinement can run",
                 owner: "workflow.py",
                 detail:
-                    "Deterministic does_not_apply and staged Yarn/pnpm applies results are terminal. npm applies and human_review baselines require agent-response.json or an explicitly selected real model turn.",
+                    "Deterministic does_not_apply and positive-only manager applies results are terminal. Other npm and inconclusive Python baselines require agent-response.json or an explicitly selected real model turn.",
                 branches: [
                     {
                         label: "Terminal deterministic result",
-                        result: "Skip the agent for does_not_apply or staged Yarn/pnpm applies.",
+                        result: "Skip the agent for does_not_apply and positive-only manager applies outcomes.",
                         tone: "safe",
                     },
                     {
@@ -448,7 +486,7 @@ const applicationFlows = [
                     },
                     {
                         label: "Model turn available",
-                        result: "Create a typed triage AgentTask and continue to validated Python reconciliation.",
+                        result: "Create a typed triage AgentTask and continue to deterministic reconciliation.",
                         tone: "agent",
                     },
                 ],
@@ -527,12 +565,12 @@ const applicationFlows = [
     },
     {
         id: "live-triage",
-        title: "Live GHEC alert triage",
+        title: "Live GitHub Enterprise Cloud alert triage",
         subtitle:
             "Collect a commit-pinned repository snapshot and send only non-terminal baselines to Copilot.",
         command:
-            "DEPENDABOT_GITHUB_TOKEN=<token> uv run dependabot-validator-grunt triage-alert --repo OWNER/REPO --alert NUMBER",
-        labels: ["live_ghec", "triage", "application-controlled agent routing"],
+            "uv run dependabot-validator-grunt triage-alert --repo OWNER/REPO --alert NUMBER",
+        labels: ["live GitHub", "triage", "application-controlled agent routing"],
         stages: [
             {
                 title: "Validate target, options, and credential roles",
@@ -547,8 +585,8 @@ const applicationFlows = [
                     "Fetch alert and repository metadata, resolve the default-branch commit SHA, download the bounded tarball, and safely extract allowed files.",
             },
             {
-                title: "Build npm evidence and deterministic baseline",
-                owner: "npm.py · deterministic.py",
+                title: "Build dependency evidence and deterministic baseline",
+                owner: "workflow.py · npm.py · python_dependencies.py · concrete Python collectors · deterministic.py",
                 detail:
                     "Record every relevant package instance and consumer, then choose does_not_apply, applies/remediate, or human_review/investigate.",
             },
@@ -556,7 +594,7 @@ const applicationFlows = [
                 title: "Apply the model gate",
                 owner: "workflow.py",
                 detail:
-                    "Skip Copilot for deterministic does_not_apply and staged Yarn/pnpm applies results. npm applies and human_review baselines require the bounded model boundary.",
+                    "Skip Copilot for deterministic does_not_apply and positive-only manager applies results. Other npm and inconclusive Python baselines require the bounded model boundary.",
                 branches: [
                     {
                         label: "Terminal deterministic result",
@@ -569,7 +607,7 @@ const applicationFlows = [
                     },
                     {
                         label: "Agent-required route",
-                        result: "Run the exact bounded custom agent and continue to validated Python reconciliation.",
+                        result: "Run the exact bounded custom agent and continue to deterministic reconciliation.",
                         tone: "agent",
                     },
                 ],
@@ -732,19 +770,19 @@ function renderOverview(initialTopic) {
     return `
       <section ${sectionAttributes("overview", initialTopic)}>
         <div class="eyebrow">Mental model</div>
-        <h2>Evidence first. Agent second. Python decides.</h2>
-        <p class="lead">This CLI reviews one Dependabot dismissal request or triages one alert. It combines deterministic npm facts with a tightly bounded Copilot investigation, then publishes local evidence-backed reports.</p>
+        <h2>Evidence first. Agent second. Deterministic code decides.</h2>
+        <p class="lead">This CLI reviews one Dependabot dismissal request or triages one alert. It combines deterministic dependency facts with one tightly bounded investigator and an application-selected ecosystem capability, then publishes local evidence-backed reports.</p>
         <div class="callout strong"><strong>The invariant:</strong> Copilot can investigate and propose. It cannot authorize an outcome, expand permissions, write to GitHub, or publish a report directly.</div>
         <div class="metric-grid">
           <article><span class="metric">2</span><strong>workflows</strong><p><code>review-dismissal</code> and <code>triage-alert</code></p></article>
-          <article><span class="metric">4</span><strong>agent tools</strong><p><code>list_files</code>, <code>read_file</code>, <code>search</code>, <code>analyze_reachability</code></p></article>
+          <article><span class="metric">4</span><strong>investigator tools</strong><p>The investigator gets list, read, search, and controlled structural analysis; the judge gets no tools.</p></article>
           <article><span class="metric">0</span><strong>GitHub writes</strong><p>Reports stay in the selected local output directory.</p></article>
         </div>
         <h3>Decision flow</h3>
         <div class="flow horizontal">
-          ${flowNode("Input", "Live GHEC target or offline fixture")}
+          ${flowNode("Input", "Live GitHub target or offline fixture")}
           <span class="arrow">→</span>
-          ${flowNode("Evidence", "Typed alert, repository, and npm facts")}
+          ${flowNode("Evidence", "Typed alert, repository, and dependency facts")}
           <span class="arrow">→</span>
           ${flowNode("Rules", "Deterministic policy and proof engine", "trusted")}
           <span class="arrow">→</span>
@@ -779,18 +817,19 @@ function renderRun(initialTopic) {
             ${command("uv run dependabot-validator-grunt review-dismissal --offline-fixture examples/offline-cases/not-used-absent")}
             ${command("uv run dependabot-validator-grunt triage-alert --offline-fixture examples/offline-cases/triage-vulnerable")}
             <h3>3. Exercise the real Copilot boundary</h3>
-            ${command("COPILOT_GITHUB_TOKEN=<copilot-user-pat> uv run dependabot-validator-grunt review-dismissal --offline-fixture examples/offline-cases/tolerable-risk --model <runtime-model-id>")}
+            ${command("uv run dependabot-validator-grunt review-dismissal --offline-fixture examples/offline-cases/tolerable-risk --model <runtime-model-id>")}
+            <p>Set <code>COPILOT_GITHUB_TOKEN</code> in <code>./.env</code> before running the real model example.</p>
           </div>
           <div>
             <h3>Run against GitHub Enterprise Cloud</h3>
-            ${command("DEPENDABOT_GITHUB_TOKEN=<github-token> uv run dependabot-validator-grunt review-dismissal --request https://github.com/OWNER/REPO/security/dependabot/ALERT_NUMBER")}
-            ${command("DEPENDABOT_GITHUB_TOKEN=<github-token> uv run dependabot-validator-grunt triage-alert --repo OWNER/REPO --alert ALERT_NUMBER")}
-            <div class="callout warning"><strong>Credential roles:</strong> live GitHub collection uses <code>DEPENDABOT_GITHUB_TOKEN</code>; real Copilot uses <code>COPILOT_GITHUB_TOKEN</code>. The CLI loads both from <code>./.env</code> without overriding exported values. One value may serve both roles, but distinct least-privileged credentials reduce revocation and exposure blast radius.</div>
+            ${command("uv run dependabot-validator-grunt review-dismissal --request https://github.com/OWNER/REPO/security/dependabot/ALERT_NUMBER")}
+            ${command("uv run dependabot-validator-grunt triage-alert --repo OWNER/REPO --alert ALERT_NUMBER")}
+            <div class="callout warning"><strong>Credential roles:</strong> add <code>DEPENDABOT_GITHUB_TOKEN</code> to <code>./.env</code> for live collection and <code>COPILOT_GITHUB_TOKEN</code> when a route may use Copilot. Existing process environment values take precedence. One value may serve both roles, but distinct least-privileged credentials reduce revocation and exposure blast radius.</div>
             <h3>Copilot mode matrix</h3>
             <div class="file-list">
               ${file("Offline dismissal or triage", "Use the scripted fixture response by default. --model explicitly selects real Copilot and overrides the script.")}
               ${file("Live dismissal review", "Deterministic routing selects agent-required routes; --model only selects the runtime model.")}
-              ${file("Live alert triage", "Deterministic does_not_apply and staged Yarn/pnpm applies skip Copilot; npm applies and human_review routes use the real boundary.")}
+              ${file("Live alert triage", "Deterministic does_not_apply and positive-only manager applies results skip Copilot; eligible npm and inconclusive Python routes use the real boundary.")}
             </div>
             <h3>Shared controls</h3>
             <div class="pill-row">${pill("--output <directory>")}${pill("--policy <file>")}${pill("--model <runtime-model-id>")}</div>
@@ -831,7 +870,7 @@ function renderFlows(initialTopic) {
             ${pill("2 configuration")}
             ${pill("3 GitHub auth")}
             ${pill("4 collection")}
-            ${pill("5 npm evidence")}
+            ${pill("5 dependency evidence")}
             ${pill("6 Copilot")}
             ${pill("7 reconciliation / validation")}
             ${pill("8 publication")}
@@ -857,17 +896,31 @@ function renderArchitecture(initialTopic) {
             ${flowNode("policy.py", "Versioned policy loading and startup validation")}
             ${flowNode("deterministic.py", "Routing, proofs, permitted outcomes, reconciliation", "trusted")}
             ${flowNode("agentic.py", "Bounded snapshot tools and untrusted-finding validation", "trusted")}
-            ${flowNode("reachability.py", "Fixed bounded ast-grep subprocess boundary", "trusted")}
+            ${flowNode("reachability.py", "Public runner and explicit profile coordination", "trusted")}
+            ${flowNode("reachability_ast_grep.py", "Trusted ast-grep staging, subprocess, bounds, and citations", "trusted")}
+            ${flowNode("reachability_npm.py", "npm JavaScript and TypeScript interpretation", "trusted")}
+            ${flowNode("reachability_python.py", "Python import and call interpretation", "trusted")}
             ${flowNode("judge.py", "No-tool two-critic review and replacement validation", "trusted")}
             ${flowNode("reporting.py", "Atomic validated report.json and report.md", "trusted")}
           </div>
           <div class="lane boundary">
-            <div class="lane-label">External boundaries</div>
-            ${flowNode("github.py", "Read-only GHEC API and immutable repository snapshot")}
+            <div class="lane-label">Evidence and runtime adapters</div>
+            ${flowNode("github.py", "Read-only GitHub API and immutable repository snapshot")}
             ${flowNode("npm.py", "Project selection and npm-ecosystem adapter dispatch")}
+            ${flowNode("python_dependencies.py", "Explicit Python collector dispatch")}
+            ${flowNode("pip_dependencies.py", "Bounded requirements-file evidence")}
+            ${flowNode("poetry_dependencies.py", "Poetry lock records and candidate graph")}
+            ${flowNode("uv_dependencies.py", "uv lock records and candidate graph")}
+            ${flowNode("unsupported_python_dependencies.py", "Declaration-only fallback manifests")}
+            ${flowNode("python_dependency_common.py", "Shared bounded path and graph helpers")}
+            ${flowNode("dependency_files.py", "Stable bounded dependency-file reads")}
+            ${flowNode("dependency.py", "Ecosystem identity and version evaluation")}
             ${flowNode("dependency_graph.py", "Manager-neutral graph projection")}
+            ${flowNode("python_imports.py", "Reviewed distribution-to-import target mapping")}
             ${flowNode("yarn.py", "Bounded Yarn Classic v1 parsing")}
             ${flowNode("pnpm.py", "Bounded pnpm lockfile v9.0 parsing")}
+            ${flowNode("agent_capabilities.py", "Closed capability selection and provenance")}
+            ${flowNode("agent_evaluation.py", "Local non-authoritative regression evaluation")}
             ${flowNode("copilot.py", "SDK lifecycle, exact agent selection, retries, events")}
             ${flowNode("copilot_assets.py", "Strict declarative asset loading and validation")}
             ${flowNode("copilot_tools.py", "Pydantic SDK tool inputs and handler adapters")}
@@ -875,7 +928,7 @@ function renderArchitecture(initialTopic) {
           <div class="lane agent-lane">
             <div class="lane-label">Model-facing package data</div>
             ${flowNode("system-prompts/", "Session-wide trust invariants", "agent")}
-            ${flowNode("agents/", "Role, output contract, tool and skill bindings", "agent")}
+            ${flowNode("agents/", "one investigator, one judge, and versioned ecosystem capabilities", "agent")}
             ${flowNode("prompts/", "One task-dispatch template per role", "agent")}
             ${flowNode("skills/", "Investigation and review methodology", "agent")}
             ${flowNode("tools/", "Names and model-facing descriptions", "agent")}
@@ -905,13 +958,13 @@ function renderCustomize(initialTopic) {
           </article>
           <article>
             <span class="number">03</span><h3>Agent identity</h3>
-            <code>src/dependabot_validator_grunt/agents/dependency-risk-investigator/agent.json</code><br/><code>src/dependabot_validator_grunt/agents/dependency-risk-judge/agent.json</code>
+            <code>src/dependabot_validator_grunt/agents/dependency-risk-investigator/agent.json</code><br/><code>src/dependabot_validator_grunt/agents/investigator-capabilities.json</code><br/><code>src/dependabot_validator_grunt/agents/dependency-risk-judge/agent.json</code>
             <p>Each custom-agent name plus its exact tool and skill bindings.</p>
             <div class="guardrail"><code>infer</code> stays false; bindings must match runtime allowlists.</div>
           </article>
           <article>
             <span class="number">04</span><h3>Agent contract</h3>
-            <code>src/dependabot_validator_grunt/agents/dependency-risk-investigator/prompt.md</code><br/><code>src/dependabot_validator_grunt/agents/dependency-risk-judge/prompt.md</code>
+            <code>src/dependabot_validator_grunt/agents/dependency-risk-investigator/prompt.md</code><br/><code>src/dependabot_validator_grunt/skills/javascript-typescript-dependency-risk-analysis/SKILL.md</code><br/><code>src/dependabot_validator_grunt/skills/python-dependency-risk-analysis/SKILL.md</code><br/><code>src/dependabot_validator_grunt/agents/dependency-risk-judge/prompt.md</code>
             <p>Role-specific structured output contracts and restrictions.</p>
             <div class="guardrail">Do not move policy authority into prose.</div>
           </article>
@@ -923,7 +976,7 @@ function renderCustomize(initialTopic) {
           </article>
           <article>
             <span class="number">06</span><h3>Methodology</h3>
-            <code>src/dependabot_validator_grunt/skills/dependency-risk-analysis/SKILL.md</code><br/><code>src/dependabot_validator_grunt/skills/dependency-risk-review/SKILL.md</code>
+            <code>src/dependabot_validator_grunt/skills/javascript-typescript-dependency-risk-analysis/SKILL.md</code><br/><code>src/dependabot_validator_grunt/skills/python-dependency-risk-analysis/SKILL.md</code><br/><code>src/dependabot_validator_grunt/skills/dependency-risk-review/SKILL.md</code>
             <p>Reusable investigation and two-lens review methodology.</p>
             <div class="guardrail">Each runtime must load exactly its role's custom-source skill.</div>
           </article>
@@ -936,7 +989,7 @@ function renderCustomize(initialTopic) {
           <article>
             <span class="number">08</span><h3>Tools</h3>
             <code>src/dependabot_validator_grunt/tools/repository-tools.json</code><br/><code>src/dependabot_validator_grunt/copilot_tools.py</code>
-            <p>Metadata is declarative; Pydantic SDK schemas and adapters stay in Python.</p>
+            <p>Metadata is declarative; executable SDK schemas and adapters stay in application code.</p>
             <div class="guardrail">Tool names must exactly match agent and session allowlists.</div>
           </article>
           <article>
@@ -946,7 +999,32 @@ function renderCustomize(initialTopic) {
             <div class="guardrail">Tighten the trusted boundary here, not in model-facing prose.</div>
           </article>
         </div>
-        <div class="callout strong"><strong>Rule of thumb:</strong> if a change affects final outcomes, put it in policy or deterministic Python and test it there. Prompts and skills can guide investigation, but they cannot make a claim trustworthy.</div>
+        <div class="callout strong"><strong>Rule of thumb:</strong> if a change affects final outcomes, put it in policy or deterministic application code and test it there. Prompts and skills can guide investigation, but they cannot make a claim trustworthy.</div>
+      </section>`;
+}
+
+function renderEvaluation(initialTopic) {
+    return `
+      <section ${sectionAttributes("evaluation", initialTopic)}>
+        <div class="eyebrow">Investigator regression checks</div>
+        <h2>Evaluate packaged capabilities without creating a workflow decision.</h2>
+        <p class="lead">The evaluator runs versioned local cases through the same asset loading, tool boundary, validation, reconciliation, and publication path used by the current investigator.</p>
+        <div class="two-column">
+          <div>
+            <h3>Run the versioned manifest</h3>
+            ${command("uv run dependabot-validator-grunt evaluate-agent-capabilities --manifest examples/offline-cases/capability-evaluation.json")}
+            <div class="callout"><strong>Default mode:</strong> render the selected packaged agent, prompt, and ecosystem skill, then replay each fixture's scripted response. Add <code>--model &lt;runtime-model-id&gt;</code> only for an explicit real-model evaluation.</div>
+          </div>
+          <div>
+            <h3>Interpret the result</h3>
+            <div class="file-list">
+              ${file("agent-evaluations/<evaluation-id>/evaluation.json", "Non-authoritative summary with manifest identity, outcomes, attempts, and bounded metrics.")}
+              ${file("cases/<case-id>/", "Isolated ordinary workflow artifacts for one evaluation case.")}
+              ${file("docs/reference/agent-capabilities.md", "Capability ownership, extension procedure, and metric interpretation.")}
+            </div>
+            <div class="callout warning"><strong>Authority:</strong> evaluation output always records <code>authoritative: false</code>. Exit 9 means a manifest, execution, validation, expectation, or publication failure; it never authorizes a Dependabot decision.</div>
+          </div>
+        </div>
       </section>`;
 }
 
@@ -963,7 +1041,7 @@ function renderSafety(initialTopic) {
               <li>List bounded snapshot files.</li>
               <li>Read bounded UTF-8 files.</li>
               <li>Search literal text and cite digest-bound observations.</li>
-              <li>Run the fixed, bounded structural reachability analysis.</li>
+              <li>Run fixed, target-aware structural analysis over selected-project profile files in bounded batches.</li>
               <li>Return one schema-validated finding.</li>
             </ul>
           </article>
@@ -981,10 +1059,10 @@ function renderSafety(initialTopic) {
         <h3>Defense in depth</h3>
         <div class="defense">
           <div><span>1</span><strong>Empty SDK mode</strong><p>Nothing is available unless the session explicitly declares it.</p></div>
-          <div><span>2</span><strong>Exact assets</strong><p>Runtime events must confirm the selected custom agent and one custom-source skill.</p></div>
+          <div><span>2</span><strong>Bounded assets</strong><p>Packaged assets are selected explicitly, and positively observed tool, skill, or agent expansion fails the run.</p></div>
           <div><span>3</span><strong>Bounded tools</strong><p>Paths, byte budgets, result counts, file types, and snapshot boundaries are checked.</p></div>
           <div><span>4</span><strong>Untrusted output</strong><p>Finding identities, citations, proposals, confidence, and flags are validated.</p></div>
-          <div><span>5</span><strong>Python reconciliation</strong><p>Load-bearing approval predicates are independently re-proven.</p></div>
+          <div><span>5</span><strong>Deterministic reconciliation</strong><p>Load-bearing approval predicates are independently re-proven.</p></div>
           <div><span>6</span><strong>Safe publication</strong><p>Atomic local writes prevent failed runs from replacing approved reports.</p></div>
         </div>
         <div class="callout warning"><strong>Never weaken a guardrail just to make an agent answer pass.</strong> An unsupported or unverifiable claim must fail closed to <code>human_review</code> or an explicit workflow failure.</div>
@@ -1016,10 +1094,11 @@ function renderChange(initialTopic) {
           ${pill("2 configuration")}
           ${pill("3 GitHub auth")}
           ${pill("4 collection")}
-          ${pill("5 npm evidence")}
+          ${pill("5 dependency evidence")}
           ${pill("6 Copilot")}
           ${pill("7 reconciliation / validation")}
           ${pill("8 publication")}
+          ${pill("9 evaluation")}
         </div>
       </section>`;
 }
@@ -1031,6 +1110,7 @@ function renderTopics(initialTopic) {
         renderFlows(initialTopic),
         renderArchitecture(initialTopic),
         renderCustomize(initialTopic),
+        renderEvaluation(initialTopic),
         renderSafety(initialTopic),
         renderChange(initialTopic),
     ].join("");

@@ -784,8 +784,18 @@ def test_normalize_dependabot_alert_success_canonical_mapping() -> None:
     assert snapshot.patched_versions == "1.3.0"
     assert snapshot.manifest_path == "package-lock.json"
     assert snapshot.scope == "runtime"
+    assert snapshot.dependency_relationship == "unknown"
     assert snapshot.cwes == ("CWE-1321",)
     assert snapshot.epss == 0.42
+
+
+def test_normalize_dependabot_alert_retains_dependency_relationship() -> None:
+    raw = _raw_alert()
+    raw["dependency"]["relationship"] = "transitive"  # type: ignore[index]
+
+    snapshot = github.normalize_dependabot_alert(raw, alert_number=7)
+
+    assert snapshot.dependency_relationship == "transitive"
 
 
 @pytest.mark.parametrize(
@@ -865,15 +875,42 @@ def test_normalize_dependabot_alert_missing_cvss_entirely_is_none() -> None:
     assert snapshot.cvss is None
 
 
-def test_normalize_dependabot_alert_rejects_non_npm_ecosystem() -> None:
+def test_normalize_dependabot_alert_accepts_python_ecosystem() -> None:
     raw = _raw_alert(
         dependency={
-            "package": {"ecosystem": "pip", "name": "left-pad"},
+            "package": {"ecosystem": "pip", "name": "Zope_Interface"},
             "manifest_path": "requirements.txt",
             "scope": "runtime",
-        }
+        },
+        security_vulnerability={
+            "package": {"ecosystem": "pip", "name": "zope-interface"},
+            "severity": "high",
+            "vulnerable_version_range": "< 6",
+            "first_patched_version": {"identifier": "6.0"},
+        },
     )
-    with pytest.raises(github.GitHubCollectionError, match="npm"):
+    snapshot = github.normalize_dependabot_alert(raw, alert_number=7)
+
+    assert snapshot.ecosystem == "pip"
+    assert snapshot.package_name == "Zope_Interface"
+    assert snapshot.package_identity == "zope-interface"
+
+
+def test_normalize_dependabot_alert_rejects_unsupported_ecosystem() -> None:
+    raw = _raw_alert(
+        dependency={
+            "package": {"ecosystem": "bundler", "name": "rack"},
+            "manifest_path": "Gemfile.lock",
+            "scope": "runtime",
+        },
+        security_vulnerability={
+            "package": {"ecosystem": "bundler", "name": "rack"},
+            "severity": "high",
+            "vulnerable_version_range": "< 3",
+            "first_patched_version": None,
+        },
+    )
+    with pytest.raises(github.GitHubCollectionError, match="npm, pip, and uv"):
         github.normalize_dependabot_alert(raw, alert_number=7)
 
 
@@ -1295,7 +1332,9 @@ def test_extract_repository_tarball_excludes_sparse_member(tmp_path: Path) -> No
     assert snapshot.excluded_paths == ("sparse-file",)
 
 
-def test_extract_repository_tarball_rejects_case_normalized_duplicate(tmp_path: Path) -> None:
+def test_extract_repository_tarball_excludes_case_normalized_duplicates(
+    tmp_path: Path,
+) -> None:
     root = "acme-widgets-abc1234"
     data = _tar_bytes(
         [
@@ -1304,19 +1343,24 @@ def test_extract_repository_tarball_rejects_case_normalized_duplicate(tmp_path: 
             (f"{root}/file.txt", b"two"),
         ]
     )
-    with pytest.raises(github.GitHubCollectionError, match="duplicate"):
-        github.extract_repository_tarball(
-            data,
-            tmp_path / "snapshot",
-            owner="acme",
-            repo="widgets",
-            default_branch="main",
-            commit_sha="4" + "a" * 39,
-            limits=_limits(),
-        )
+    snapshot = github.extract_repository_tarball(
+        data,
+        tmp_path / "snapshot",
+        owner="acme",
+        repo="widgets",
+        default_branch="main",
+        commit_sha="4" + "a" * 39,
+        limits=_limits(),
+    )
+
+    assert snapshot.included_paths == ()
+    assert snapshot.excluded_paths == ("FILE.txt", "file.txt")
+    assert snapshot.coverage_excluded_paths == ("FILE.txt", "file.txt")
 
 
-def test_extract_repository_tarball_rejects_unicode_normalized_duplicate(tmp_path: Path) -> None:
+def test_extract_repository_tarball_excludes_unicode_normalized_duplicates(
+    tmp_path: Path,
+) -> None:
     root = "acme-widgets-abc1234"
     nfc_name = unicodedata.normalize("NFC", "café.txt")
     nfd_name = unicodedata.normalize("NFD", "café.txt")
@@ -1328,15 +1372,143 @@ def test_extract_repository_tarball_rejects_unicode_normalized_duplicate(tmp_pat
             (f"{root}/{nfd_name}", b"two"),
         ]
     )
-    with pytest.raises(github.GitHubCollectionError, match="duplicate"):
+    snapshot = github.extract_repository_tarball(
+        data,
+        tmp_path / "snapshot",
+        owner="acme",
+        repo="widgets",
+        default_branch="main",
+        commit_sha="5" + "a" * 39,
+        limits=_limits(),
+    )
+
+    assert snapshot.included_paths == ()
+    assert snapshot.excluded_paths == tuple(sorted((nfc_name, nfd_name)))
+    assert snapshot.coverage_excluded_paths == tuple(sorted((nfc_name, nfd_name)))
+
+
+def test_extract_repository_tarball_rejects_selected_dependency_collision(
+    tmp_path: Path,
+) -> None:
+    root = "acme-widgets-abc1234"
+    data = _tar_bytes(
+        [
+            _dir_entry(root),
+            (f"{root}/PACKAGE.JSON", b"{}"),
+            (f"{root}/package.json", b"{}"),
+        ]
+    )
+
+    with pytest.raises(github.GitHubCollectionError, match="selected dependency path"):
         github.extract_repository_tarball(
             data,
             tmp_path / "snapshot",
             owner="acme",
             repo="widgets",
             default_branch="main",
-            commit_sha="5" + "a" * 39,
+            commit_sha="5" + "b" * 39,
             limits=_limits(),
+            selected_dependency_path="package.json",
+        )
+
+
+def test_extract_repository_tarball_excludes_exact_duplicate_path(tmp_path: Path) -> None:
+    root = "acme-widgets-abc1234"
+    data = _tar_bytes(
+        [
+            _dir_entry(root),
+            (f"{root}/source.py", b"one"),
+            (f"{root}/source.py", b"two"),
+        ]
+    )
+
+    snapshot = github.extract_repository_tarball(
+        data,
+        tmp_path / "snapshot",
+        owner="acme",
+        repo="widgets",
+        default_branch="main",
+        commit_sha="5" + "e" * 39,
+        limits=_limits(),
+    )
+
+    assert snapshot.included_paths == ()
+    assert snapshot.coverage_excluded_paths == ("source.py",)
+
+
+def test_extract_repository_tarball_rejects_exact_duplicate_selected_path(
+    tmp_path: Path,
+) -> None:
+    root = "acme-widgets-abc1234"
+    data = _tar_bytes(
+        [
+            _dir_entry(root),
+            (f"{root}/requirements.txt", b"requests==2.31.0"),
+            (f"{root}/requirements.txt", b"requests==2.32.0"),
+        ]
+    )
+
+    with pytest.raises(github.GitHubCollectionError, match="selected dependency path"):
+        github.extract_repository_tarball(
+            data,
+            tmp_path / "snapshot",
+            owner="acme",
+            repo="widgets",
+            default_branch="main",
+            commit_sha="5" + "f" * 39,
+            limits=_limits(),
+            selected_dependency_path="requirements.txt",
+        )
+
+
+def test_extract_repository_tarball_excludes_ancestor_case_collision(
+    tmp_path: Path,
+) -> None:
+    root = "acme-widgets-abc1234"
+    data = _tar_bytes(
+        [
+            _dir_entry(root),
+            (f"{root}/A/source.js", b"one"),
+            (f"{root}/a/other.js", b"two"),
+        ]
+    )
+
+    snapshot = github.extract_repository_tarball(
+        data,
+        tmp_path / "snapshot",
+        owner="acme",
+        repo="widgets",
+        default_branch="main",
+        commit_sha="5" + "c" * 39,
+        limits=_limits(),
+    )
+
+    assert snapshot.included_paths == ()
+    assert snapshot.coverage_excluded_paths == ("A/source.js", "a/other.js")
+
+
+def test_extract_repository_tarball_rejects_selected_dependency_below_collision(
+    tmp_path: Path,
+) -> None:
+    root = "acme-widgets-abc1234"
+    data = _tar_bytes(
+        [
+            _dir_entry(root),
+            (f"{root}/A/package.json", b"{}"),
+            (f"{root}/a/source.js", b"two"),
+        ]
+    )
+
+    with pytest.raises(github.GitHubCollectionError, match="selected dependency path"):
+        github.extract_repository_tarball(
+            data,
+            tmp_path / "snapshot",
+            owner="acme",
+            repo="widgets",
+            default_branch="main",
+            commit_sha="5" + "d" * 39,
+            limits=_limits(),
+            selected_dependency_path="A/package.json",
         )
 
 
@@ -1377,19 +1549,22 @@ def test_extract_repository_tarball_rejects_member_count_over_limit(tmp_path: Pa
         )
 
 
-def test_extract_repository_tarball_rejects_single_file_over_limit(tmp_path: Path) -> None:
+def test_extract_repository_tarball_excludes_single_file_over_limit(tmp_path: Path) -> None:
     root = "acme-widgets-abc1234"
     data = _tar_bytes([_dir_entry(root), (f"{root}/big.bin", b"x" * 1000)])
-    with pytest.raises(github.GitHubCollectionError, match="file byte limit"):
-        github.extract_repository_tarball(
-            data,
-            tmp_path / "snapshot",
-            owner="acme",
-            repo="widgets",
-            default_branch="main",
-            commit_sha="8" + "a" * 39,
-            limits=_limits(max_archive_file_bytes=100),
-        )
+    snapshot = github.extract_repository_tarball(
+        data,
+        tmp_path / "snapshot",
+        owner="acme",
+        repo="widgets",
+        default_branch="main",
+        commit_sha="8" + "a" * 39,
+        limits=_limits(max_archive_file_bytes=100),
+    )
+
+    assert snapshot.included_paths == ()
+    assert snapshot.excluded_paths == ("big.bin",)
+    assert snapshot.coverage_excluded_paths == ("big.bin",)
 
 
 def test_extract_repository_tarball_allows_larger_dependency_file_only(
@@ -1411,16 +1586,70 @@ def test_extract_repository_tarball_allows_larger_dependency_file_only(
     assert snapshot.included_paths == ("nested/package-lock.json",)
 
     ordinary_data = _tar_bytes([_dir_entry(root), (f"{root}/nested/application.js", b"x" * 1000)])
-    with pytest.raises(github.GitHubCollectionError, match="file byte limit"):
-        github.extract_repository_tarball(
-            ordinary_data,
-            tmp_path / "ordinary-snapshot",
-            owner="acme",
-            repo="widgets",
-            default_branch="main",
-            commit_sha="8" + "c" * 39,
-            limits=_limits(max_archive_file_bytes=100, max_dependency_file_bytes=1000),
-        )
+    ordinary_snapshot = github.extract_repository_tarball(
+        ordinary_data,
+        tmp_path / "ordinary-snapshot",
+        owner="acme",
+        repo="widgets",
+        default_branch="main",
+        commit_sha="8" + "c" * 39,
+        limits=_limits(max_archive_file_bytes=100, max_dependency_file_bytes=1000),
+    )
+    assert ordinary_snapshot.excluded_paths == ("nested/application.js",)
+
+
+@pytest.mark.parametrize("path", ("pyproject.toml", "poetry.lock", "uv.lock"))
+def test_extract_repository_tarball_allows_larger_python_dependency_files(
+    path: str,
+    tmp_path: Path,
+) -> None:
+    root = "acme-widgets-abc1234"
+    data = _tar_bytes([_dir_entry(root), (f"{root}/nested/{path}", b"x" * 1000)])
+
+    snapshot = github.extract_repository_tarball(
+        data,
+        tmp_path / path.replace(".", "-"),
+        owner="acme",
+        repo="widgets",
+        default_branch="main",
+        commit_sha="8" + "d" * 39,
+        limits=_limits(max_archive_file_bytes=100, max_dependency_file_bytes=1000),
+    )
+
+    assert snapshot.included_paths == (f"nested/{path}",)
+
+
+def test_extract_repository_tarball_limits_dependency_allowance_to_selected_requirements(
+    tmp_path: Path,
+) -> None:
+    root = "acme-widgets-abc1234"
+    selected = _tar_bytes(
+        [_dir_entry(root), (f"{root}/services/api/requirements.txt", b"x" * 1000)]
+    )
+    snapshot = github.extract_repository_tarball(
+        selected,
+        tmp_path / "selected-requirements",
+        owner="acme",
+        repo="widgets",
+        default_branch="main",
+        commit_sha="8" + "e" * 39,
+        limits=_limits(max_archive_file_bytes=100, max_dependency_file_bytes=1000),
+        selected_dependency_path="services/api/requirements.txt",
+    )
+    assert snapshot.included_paths == ("services/api/requirements.txt",)
+
+    unrelated = _tar_bytes([_dir_entry(root), (f"{root}/docs/requirements.txt", b"x" * 1000)])
+    unrelated_snapshot = github.extract_repository_tarball(
+        unrelated,
+        tmp_path / "unrelated-requirements",
+        owner="acme",
+        repo="widgets",
+        default_branch="main",
+        commit_sha="8" + "f" * 39,
+        limits=_limits(max_archive_file_bytes=100, max_dependency_file_bytes=1000),
+        selected_dependency_path="services/api/requirements.txt",
+    )
+    assert unrelated_snapshot.excluded_paths == ("docs/requirements.txt",)
 
 
 def test_extract_repository_tarball_rejects_expanded_total_over_limit(tmp_path: Path) -> None:

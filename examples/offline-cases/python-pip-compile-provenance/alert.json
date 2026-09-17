@@ -1,0 +1,1 @@
+{"alert_number":503,"advisory_id":"GHSA-demo-0503","summary":"Synthetic requests advisory for an anonymized pip-compile service.","severity":"medium","ecosystem":"pip","package_name":"requests","vulnerable_range":"<2.32.0","patched_versions":">=2.32.0","manifest_path":"requirements.txt","scope":"runtime","dependency_relationship":"transitive"}

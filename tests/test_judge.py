@@ -21,9 +21,9 @@ from dependabot_validator_grunt.models import (
     AgentProposalPermission,
     AgentTask,
     CriticAssessment,
+    DependencyInstance,
     JudgeFailure,
     JudgeReview,
-    NpmInstance,
 )
 
 
@@ -36,6 +36,9 @@ def _task() -> AgentTask:
         dismissal_reason="not_used",
         snapshot_id="snapshot",
         policy_digest="policy",
+        ecosystem="pip",
+        dependency_package_manager="pip",
+        dependency_version_scheme="pep440",
         permitted_proposals=(
             AgentProposalPermission(
                 recommendation="deny",
@@ -62,6 +65,10 @@ def _finding(task: AgentTask, *, claim: str = "No supported conclusion.") -> Age
         citations=(),
         uncertainty="No repository fact was cited.",
         proposed_recommendation="human_review",
+        policy_reason_code="insufficient_context",
+        confidence=0.5,
+        insufficient_context=True,
+        injection_detected=False,
     )
 
 
@@ -178,6 +185,25 @@ def test_validate_judge_review_rejects_unobserved_replacement_citation(
         )
 
 
+@pytest.mark.parametrize("blocker", ("insufficient_context", "injection_detected"))
+def test_validate_judge_review_cannot_clear_primary_blocker(
+    blocker: str,
+    tmp_path: Path,
+) -> None:
+    task = _task()
+    primary = _finding(task).model_copy(update={blocker: True})
+    replacement = _finding(task, claim="Corrected conclusion.").model_copy(update={blocker: False})
+    review = _review(task, verdict="replace", replacement=replacement)
+
+    with pytest.raises(ValueError, match="cannot clear"):
+        validate_judge_review(
+            review,
+            task=task,
+            primary_finding=primary,
+            tools=RepositoryTools(tmp_path),
+        )
+
+
 def test_validate_judge_review_rejects_observed_but_unexposed_citation(
     tmp_path: Path,
 ) -> None:
@@ -220,16 +246,19 @@ def test_judge_prompt_is_bounded_for_large_context(tmp_path: Path) -> None:
 def test_judge_payload_includes_bounded_applicability_context(tmp_path: Path) -> None:
     task = _task().model_copy(
         update={
-            "npm_completeness": "complete",
+            "dependency_completeness": "complete",
+            "installed_instance_count": 1,
             "installed_instance_details": (
-                NpmInstance(
+                DependencyInstance(
                     path="node_modules/package",
                     version="1.0.0",
                     relationship="development",
                     comparable=True,
                     development_only=True,
+                    source_kind="registry",
                 ),
             ),
+            "dependency_consumer_count": 1,
             "dependency_consumers": ("node_modules/consumer",),
         }
     )
@@ -238,7 +267,9 @@ def test_judge_payload_includes_bounded_applicability_context(tmp_path: Path) ->
     task_payload = payload["task"]
 
     assert isinstance(task_payload, dict)
-    assert task_payload["npm_completeness"] == "complete"
+    assert task_payload["dependency_completeness"] == "complete"
+    assert "installed_instances" not in task_payload
+    assert task_payload["installed_instance_count"] == 1
     assert task_payload["dependency_consumers"] == ["node_modules/consumer"]
     assert task_payload["installed_instance_details"] == [
         {
@@ -247,6 +278,8 @@ def test_judge_payload_includes_bounded_applicability_context(tmp_path: Path) ->
             "relationship": "development",
             "comparable": True,
             "development_only": True,
+            "source_kind": "registry",
+            "source_locator": None,
         }
     ]
 
@@ -291,7 +324,7 @@ class _Judge:
 async def test_judged_turn_accepts_primary_finding_unchanged(tmp_path: Path) -> None:
     task = _task()
     primary = _finding(task)
-    turn = JudgedModelTurn(_Primary(primary), _Judge(_review(task)))
+    turn = JudgedModelTurn(_Primary(primary), lambda: _Judge(_review(task)))
 
     output = await turn.run(
         task,
@@ -311,7 +344,7 @@ async def test_judged_turn_uses_valid_replacement(tmp_path: Path) -> None:
     replacement = _finding(task, claim="Corrected conclusion.")
     turn = JudgedModelTurn(
         _Primary(primary),
-        _Judge(_review(task, verdict="replace", replacement=replacement)),
+        lambda: _Judge(_review(task, verdict="replace", replacement=replacement)),
     )
 
     output = await turn.run(
@@ -329,7 +362,7 @@ async def test_judged_turn_uses_valid_replacement(tmp_path: Path) -> None:
 async def test_judged_turn_retains_primary_when_judge_fails(tmp_path: Path) -> None:
     task = _task()
     primary = _finding(task)
-    turn = JudgedModelTurn(_Primary(primary), _Judge(RuntimeError("unavailable")))
+    turn = JudgedModelTurn(_Primary(primary), lambda: _Judge(RuntimeError("unavailable")))
 
     output = await turn.run(
         task,
@@ -340,3 +373,130 @@ async def test_judged_turn_retains_primary_when_judge_fails(tmp_path: Path) -> N
 
     assert AgentFinding.model_validate(output["finding"]) == primary
     assert JudgeFailure.model_validate(output["judge_review"]).reason == "sdk_failure"
+
+
+@pytest.mark.asyncio
+async def test_judged_turn_constructs_judge_only_after_primary_validation(
+    tmp_path: Path,
+) -> None:
+    task = _task()
+    primary = _finding(task)
+    constructions = 0
+
+    def judge_provider() -> _Judge:
+        nonlocal constructions
+        constructions += 1
+        return _Judge(_review(task))
+
+    turn = JudgedModelTurn(_Primary(primary), judge_provider)
+
+    assert constructions == 0
+    await turn.run(
+        task,
+        RepositoryTools(tmp_path),
+        max_attempts=2,
+        wall_clock_seconds=360,
+    )
+    assert constructions == 1
+
+
+@pytest.mark.asyncio
+async def test_judged_turn_retains_primary_when_judge_construction_fails(
+    tmp_path: Path,
+) -> None:
+    task = _task()
+    primary = _finding(task)
+
+    def judge_provider() -> _Judge:
+        raise RuntimeError("broken judge assets")
+
+    output = await JudgedModelTurn(_Primary(primary), judge_provider).run(
+        task,
+        RepositoryTools(tmp_path),
+        max_attempts=2,
+        wall_clock_seconds=360,
+    )
+
+    assert AgentFinding.model_validate(output["finding"]) == primary
+    assert JudgeFailure.model_validate(output["judge_review"]).reason == "sdk_failure"
+
+
+@pytest.mark.asyncio
+async def test_judged_turn_does_not_construct_judge_when_primary_fails(
+    tmp_path: Path,
+) -> None:
+    task = _task()
+    constructions = 0
+
+    class FailingPrimary:
+        identity = "failing-primary"
+
+        async def run(
+            self,
+            task: AgentTask,
+            tools: RepositoryTools,
+            *,
+            max_attempts: int,
+            wall_clock_seconds: float,
+        ) -> dict[str, object]:
+            del task, tools, max_attempts, wall_clock_seconds
+            raise ValueError("primary failed")
+
+    def judge_provider() -> _Judge:
+        nonlocal constructions
+        constructions += 1
+        return _Judge(_review(task))
+
+    with pytest.raises(ValueError, match="primary failed"):
+        await JudgedModelTurn(FailingPrimary(), judge_provider).run(
+            task,
+            RepositoryTools(tmp_path),
+            max_attempts=2,
+            wall_clock_seconds=360,
+        )
+
+    assert constructions == 0
+
+
+@pytest.mark.asyncio
+async def test_judged_turn_validates_reachability_before_constructing_judge(
+    tmp_path: Path,
+) -> None:
+    task = _task().model_copy(
+        update={
+            "ecosystem": "npm",
+            "package_name": "lodash",
+            "package_identity": "lodash",
+            "dependency_package_manager": "npm",
+            "dependency_version_scheme": "npm",
+        }
+    )
+    primary = _finding(task)
+    constructions = 0
+
+    def judge_provider() -> _Judge:
+        nonlocal constructions
+        constructions += 1
+        return _Judge(_review(task))
+
+    class NoReachabilityPrimary(_Primary):
+        async def run(
+            self,
+            task: AgentTask,
+            tools: RepositoryTools,
+            *,
+            max_attempts: int,
+            wall_clock_seconds: float,
+        ) -> dict[str, object]:
+            del task, tools, max_attempts, wall_clock_seconds
+            return {"finding": self.finding.model_dump(mode="json")}
+
+    with pytest.raises(ValueError, match="reachability analysis was not invoked"):
+        await JudgedModelTurn(NoReachabilityPrimary(primary), judge_provider).run(
+            task,
+            RepositoryTools(tmp_path),
+            max_attempts=2,
+            wall_clock_seconds=360,
+        )
+
+    assert constructions == 0

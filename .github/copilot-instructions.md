@@ -28,7 +28,7 @@ responsibility and follow `docs/architecture.md`. Do not introduce layers,
 registries, factories, or protocols without a current use.
 
 - Keep CLI parsing and dependency construction in `main.py`.
-- Put workflow orchestration in `workflow.py` or `workflows/` once needed.
+- Put workflow orchestration in `workflow.py`.
 - Isolate Copilot SDK lifecycle and session behavior in `copilot.py`.
 - Keep GitHub access, tools, models, validation, and reporting in focused modules.
 - Add one protocol at the Copilot boundary so default tests can use an offline
@@ -62,7 +62,7 @@ or weaken checks merely to make failures pass.
 
 ## Copilot SDK rules
 
-- Target `github-copilot-sdk>=1.0.11` and Python 3.12-3.14.
+- Target `github-copilot-sdk>=1.0.13` and Python 3.12-3.14.
 - Construct `CopilotClient` with `mode="empty"` so sessions must declare their
   available tools.
 - Use async context managers for client and session lifecycle.

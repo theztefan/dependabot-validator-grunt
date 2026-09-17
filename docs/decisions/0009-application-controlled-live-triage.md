@@ -37,12 +37,12 @@ use the real SDK only when explicitly requested.
   constructs the Copilot boundary when `COPILOT_GITHUB_TOKEN` is available.
 - Keep `--model` as model selection rather than agent enablement. Defer its
   credential and availability validation until trusted routing selects an
-  agentic route, so deterministic `does_not_apply` remains terminal.
+  investigator route, so deterministic `does_not_apply` remains terminal.
 - Preserve current offline fixture behavior when no scripted or explicitly
   requested real model turn is available.
 
 ADR 0019 later makes positive Yarn and pnpm applicability terminal because
-those adapters cannot authorize an agentic non-applicability exception.
+those adapters cannot authorize an investigator-proposed non-applicability exception.
 
 ## Consequences
 

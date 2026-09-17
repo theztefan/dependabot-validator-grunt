@@ -180,7 +180,8 @@ extensionSession = await joinSession({
                 showTopic(entry, initialTopic);
                 return {
                     title: "Dependabot Validator Grunt onboarding",
-                    status: "Runbook, full flows, architecture, customization, and safety",
+                    status:
+                        "Runbook, full flows, architecture, customization, evaluation, and safety",
                     url: entry.url,
                 };
             },

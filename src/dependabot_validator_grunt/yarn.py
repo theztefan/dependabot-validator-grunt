@@ -7,6 +7,7 @@ import re
 import shlex
 from dataclasses import dataclass, field
 from typing import cast
+from urllib.parse import urlparse
 
 from dependabot_validator_grunt.dependency_graph import (
     DependencyEdge,
@@ -14,7 +15,7 @@ from dependabot_validator_grunt.dependency_graph import (
     DependencyGraph,
     DependencyNode,
 )
-from dependabot_validator_grunt.models import NpmDeclaration
+from dependabot_validator_grunt.models import DependencyDeclaration, SourceKind
 
 _SEMVER = re.compile(
     r"^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
@@ -79,10 +80,29 @@ def _field(line: str) -> tuple[str, str]:
     return parts[0], parts[1]
 
 
+def _source_metadata(resolved: str | None) -> tuple[SourceKind, str | None]:
+    if resolved is None:
+        return "unknown", None
+    lowered = resolved.casefold()
+    if lowered.startswith(("git+", "git://", "ssh://", "git@", "github:", "gitlab:")):
+        return "vcs", resolved
+    if lowered.startswith(("file:", "link:", "./", "../", "/")):
+        return "path", resolved
+    parsed = urlparse(resolved)
+    if parsed.scheme.casefold() in {"http", "https"}:
+        if (parsed.hostname or "").casefold() in {
+            "registry.npmjs.org",
+            "registry.yarnpkg.com",
+        }:
+            return "registry", resolved
+        return "url", resolved
+    return "unknown", resolved
+
+
 def parse_yarn_classic(
     text: str,
     *,
-    declarations: tuple[NpmDeclaration, ...],
+    declarations: tuple[DependencyDeclaration, ...],
 ) -> DependencyGraph:
     """Parse the deterministic subset of Yarn Classic lockfile v1."""
     lines = text.splitlines()
@@ -162,6 +182,7 @@ def parse_yarn_classic(
         registry_source = isinstance(record.resolved, str) and record.resolved.startswith(
             ("https://registry.yarnpkg.com/", "https://registry.npmjs.org/")
         )
+        source_kind, source_locator = _source_metadata(record.resolved)
         nodes.append(
             DependencyNode(
                 instance_id=instance_id,
@@ -170,6 +191,8 @@ def parse_yarn_classic(
                 comparable=bool(
                     registry_source and record.version and _SEMVER.fullmatch(record.version)
                 ),
+                source_kind=source_kind,
+                source_locator=source_locator,
             )
         )
         record_names[instance_id] = actual_name
@@ -214,7 +237,6 @@ def parse_yarn_classic(
             )
         )
     return DependencyGraph(
-        package_manager="yarn-classic",
         lockfile_version="1",
         nodes=tuple(nodes),
         edges=tuple(edges),

@@ -2,7 +2,7 @@
 
 ## Setup
 
-```bash
+```text
 uv sync --all-groups --locked
 uv run python -m copilot download-runtime
 ```
@@ -17,7 +17,7 @@ embedding.
 
 ## Canonical checks
 
-```bash
+```text
 uv run pytest
 uv run ruff check .
 uv run ruff format --check .
@@ -57,7 +57,7 @@ or `in-progress`; never resume a plan marked historical or complete.
 
 When integration tests exist, run them explicitly:
 
-```bash
+```text
 uv run pytest -m integration
 ```
 

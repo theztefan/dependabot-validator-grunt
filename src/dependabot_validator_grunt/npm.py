@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path, PurePath, PurePosixPath
 from typing import Literal, cast
@@ -10,11 +9,13 @@ from urllib.parse import urlparse
 
 from pydantic import TypeAdapter, ValidationError
 
+from dependabot_validator_grunt.dependency_files import bounded_json_object, bounded_text
 from dependabot_validator_grunt.dependency_graph import project_target
 from dependabot_validator_grunt.models import (
-    NpmDeclaration,
-    NpmEvidence,
-    NpmInstance,
+    DependencyDeclaration,
+    DependencyEvidence,
+    DependencyInstance,
+    SourceKind,
     validate_safe_identifier,
 )
 from dependabot_validator_grunt.pnpm import parse_pnpm_v9
@@ -34,32 +35,45 @@ DEPENDENCY_SECTIONS: dict[
     "optionalDependencies": "optional",
     "peerDependencies": "peer",
 }
+_PACKAGE_LOCK_V1_MAX_TRAVERSAL_STEPS = 100_000
+_PACKAGE_LOCK_V1_MAX_MATCHING_INSTANCES = 10_000
+_PACKAGE_LOCK_V1_MAX_CONSUMERS = 10_000
+_PACKAGE_LOCK_V1_MAX_SERIALIZED_OUTPUT_BYTES = 2 * 1024 * 1024
 
 
-def _bounded_text(path: Path, max_bytes: int) -> str:
-    if path.is_symlink():
-        raise ValueError("dependency file symlinks are denied")
-    before = path.stat()
-    with path.open("rb") as file:
-        data = file.read(max_bytes + 1)
-    if len(data) > max_bytes:
-        raise ValueError("dependency file exceeds the configured byte limit")
-    after = path.stat()
-    if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
-        raise ValueError("dependency file changed while it was read")
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise ValueError("dependency file is not valid UTF-8") from error
+def _npm_source_metadata(
+    raw_version: object,
+    resolved_source: object,
+) -> tuple[SourceKind, str | None]:
+    def classify(locator: str) -> SourceKind:
+        lowered = locator.casefold()
+        if lowered.startswith("workspace:"):
+            return "workspace"
+        if lowered.startswith(
+            ("git+", "git://", "ssh://", "git@", "github:", "gitlab:", "bitbucket:")
+        ):
+            return "vcs"
+        if lowered.startswith(("file:", "link:", "./", "../", "/")):
+            return "path"
+        if lowered.startswith("npm:"):
+            return "registry"
+        parsed = urlparse(locator)
+        if parsed.scheme.casefold() in {"http", "https"}:
+            if (parsed.hostname or "").casefold() in {
+                "registry.npmjs.org",
+                "registry.yarnpkg.com",
+            }:
+                return "registry"
+            return "url"
+        return "unknown"
 
-
-def _bounded_json_object(path: Path, max_bytes: int) -> dict[str, object]:
-    decoded = _bounded_text(path, max_bytes)
-    try:
-        raw = json.loads(decoded)
-    except json.JSONDecodeError as error:
-        raise ValueError("dependency file contains malformed JSON") from error
-    return TypeAdapter(dict[str, object]).validate_python(raw)
+    if isinstance(resolved_source, str):
+        return classify(resolved_source), resolved_source
+    if isinstance(raw_version, str):
+        source_kind = classify(raw_version)
+        if source_kind != "unknown":
+            return source_kind, raw_version
+    return "unknown", None
 
 
 def _project_paths(
@@ -133,9 +147,9 @@ def _manifest_declarations(
     *,
     package_name: str,
     manifest_path: str,
-) -> tuple[NpmDeclaration, ...]:
+) -> tuple[DependencyDeclaration, ...]:
     adapter = TypeAdapter(dict[str, object])
-    declarations: list[NpmDeclaration] = []
+    declarations: list[DependencyDeclaration] = []
     for section, relationship in DEPENDENCY_SECTIONS.items():
         mapping = adapter.validate_python(package_json.get(section, {}))
         for name, raw_spec in mapping.items():
@@ -145,7 +159,7 @@ def _manifest_declarations(
             if name != package_name and alias_target != package_name:
                 continue
             declarations.append(
-                NpmDeclaration(
+                DependencyDeclaration(
                     manifest_path=manifest_path,
                     name=name,
                     spec=raw_spec,
@@ -197,6 +211,150 @@ def version_is_vulnerable(version: str, vulnerable_range: str) -> bool:
     return True
 
 
+def _collect_package_lock_v1(
+    raw: dict[str, object],
+    *,
+    package_name: str,
+    package_manifest: str,
+    lock_manifest: str,
+    declarations: tuple[DependencyDeclaration, ...],
+) -> DependencyEvidence:
+    adapter = TypeAdapter(dict[str, object])
+    root_dependencies = raw.get("dependencies")
+    if not isinstance(root_dependencies, dict):
+        raise ValueError("package-lock version 1 dependencies must be an object")
+
+    instances: list[DependencyInstance] = []
+    consumers: set[str] = set()
+    issues: set[str] = set()
+    traversal_steps = 0
+    matching_instance_count = 0
+    serialized_record_bytes = 0
+
+    def charge_serialized_record(value: str) -> None:
+        nonlocal serialized_record_bytes
+        size = len(value.encode("utf-8"))
+        if serialized_record_bytes + size > _PACKAGE_LOCK_V1_MAX_SERIALIZED_OUTPUT_BYTES:
+            raise ValueError(
+                "package-lock version 1 serialized evidence exceeds the configured limit"
+            )
+        serialized_record_bytes += size
+
+    def add_issue(message: str) -> None:
+        if message in issues:
+            return
+        charge_serialized_record(f"{message!r}")
+        issues.add(message)
+
+    def add_consumer(consumer: str) -> None:
+        if consumer in consumers:
+            return
+        if len(consumers) >= _PACKAGE_LOCK_V1_MAX_CONSUMERS:
+            raise ValueError("package-lock version 1 consumer count exceeds the configured limit")
+        charge_serialized_record(f"{consumer!r}")
+        consumers.add(consumer)
+
+    def append_instance(instance: DependencyInstance) -> None:
+        charge_serialized_record(instance.model_dump_json())
+        instances.append(instance)
+
+    add_issue("package-lock 1 support is positive-evidence only")
+    direct_relationships: set[Literal["direct", "development", "optional"]] = set()
+    for declaration in declarations:
+        if declaration.name == package_name and declaration.relationship != "peer":
+            direct_relationships.add(declaration.relationship)
+    stack: list[tuple[dict[str, object], str, int]] = [
+        (adapter.validate_python(root_dependencies), "", 0)
+    ]
+    while stack:
+        dependencies, parent_path, depth = stack.pop()
+        if depth > 256:
+            raise ValueError("package-lock version 1 dependency tree is too deep")
+        for name, raw_entry in dependencies.items():
+            if traversal_steps >= _PACKAGE_LOCK_V1_MAX_TRAVERSAL_STEPS:
+                raise ValueError(
+                    "package-lock version 1 traversal step count exceeds the configured limit"
+                )
+            traversal_steps += 1
+            path = f"{parent_path}/node_modules/{name}" if parent_path else f"node_modules/{name}"
+            if name == package_name:
+                if matching_instance_count >= _PACKAGE_LOCK_V1_MAX_MATCHING_INSTANCES:
+                    raise ValueError(
+                        "package-lock version 1 matching instance count "
+                        "exceeds the configured limit"
+                    )
+                matching_instance_count += 1
+            try:
+                entry = adapter.validate_python(raw_entry)
+            except ValidationError:
+                add_issue(f"malformed package entry: {path}")
+                continue
+            nested = entry.get("dependencies", {})
+            if not isinstance(nested, dict):
+                add_issue(f"malformed package dependencies: {path}")
+            elif nested:
+                stack.append((adapter.validate_python(nested), path, depth + 1))
+            if name != package_name:
+                continue
+
+            raw_version = entry.get("version")
+            resolved_source = entry.get("resolved")
+            parsed_source = urlparse(resolved_source) if isinstance(resolved_source, str) else None
+            comparable = (
+                isinstance(raw_version, str)
+                and SEMVER.fullmatch(raw_version) is not None
+                and parsed_source is not None
+                and parsed_source.scheme.lower() in {"http", "https"}
+                and parsed_source.hostname == "registry.npmjs.org"
+            )
+            if not comparable:
+                add_issue(f"uncomparable instance: {path}")
+            source_kind, source_locator = _npm_source_metadata(
+                raw_version,
+                resolved_source,
+            )
+
+            relationship: Literal["direct", "development", "optional", "transitive"] = "transitive"
+            if not parent_path and len(direct_relationships) == 1:
+                relationship = next(iter(direct_relationships))
+            if parent_path:
+                add_consumer(parent_path)
+            append_instance(
+                DependencyInstance(
+                    path=path,
+                    version=raw_version if isinstance(raw_version, str) else None,
+                    relationship=relationship,
+                    comparable=comparable,
+                    development_only=entry.get("dev") is True,
+                    source_kind=source_kind,
+                    source_locator=source_locator,
+                )
+            )
+
+    capabilities: tuple[Literal["resolved_instances"], ...] = ()
+    if any(instance.comparable for instance in instances):
+        capabilities = ("resolved_instances",)
+    evidence = DependencyEvidence(
+        package_manager="npm",
+        lockfile_version="1",
+        lockfile_path=lock_manifest,
+        proof_capabilities=capabilities,
+        package_name=package_name,
+        instances=tuple(instances),
+        manifest_paths=(package_manifest, lock_manifest),
+        declarations=declarations,
+        dependency_consumers=tuple(sorted(consumers)),
+        completeness="partial",
+        issues=tuple(sorted(issues)),
+    )
+    if (
+        len(evidence.model_dump_json().encode("utf-8"))
+        > _PACKAGE_LOCK_V1_MAX_SERIALIZED_OUTPUT_BYTES
+    ):
+        raise ValueError("package-lock version 1 serialized evidence exceeds the configured limit")
+    return evidence
+
+
 def collect_npm_evidence(
     repository: Path,
     package_name: str,
@@ -204,26 +362,31 @@ def collect_npm_evidence(
     *,
     max_dependency_file_bytes: int = 32 * 1024 * 1024,
     excluded_paths: tuple[str, ...] = (),
-) -> NpmEvidence:
-    """Collect every installed instance from a package-lock v2/v3 file."""
+) -> DependencyEvidence:
+    """Collect dependency evidence from the selected npm ecosystem input."""
     package_json_path, lock_path, prefix, package_manager = _project_paths(
         repository, manifest_path
     )
     project_root = package_json_path.parent
     package_manifest = f"{prefix}package.json"
     lock_manifest = f"{prefix}{lock_path.name}"
+    selected_name = PurePosixPath(PurePath(manifest_path).as_posix()).name
     if package_manifest in excluded_paths or lock_manifest in excluded_paths:
         raise ValueError("selected npm dependency file was excluded from the snapshot")
-    package_json = _bounded_json_object(package_json_path, max_dependency_file_bytes)
+    if lock_path.is_symlink():
+        raise ValueError("dependency file symlinks are denied")
+    if selected_name != "package.json" and not lock_path.is_file():
+        raise ValueError(f"selected npm dependency file is missing: {lock_manifest}")
+    if not package_json_path.is_file():
+        raise ValueError(f"selected npm project manifest is missing: {package_manifest}")
+    package_json = bounded_json_object(package_json_path, max_dependency_file_bytes)
     declarations = _manifest_declarations(
         package_json,
         package_name=package_name,
         manifest_path=package_manifest,
     )
-    if lock_path.is_symlink():
-        raise ValueError("dependency file symlinks are denied")
     if not lock_path.is_file():
-        return NpmEvidence(
+        return DependencyEvidence(
             package_manager=package_manager,
             lockfile_version=None,
             lockfile_path=None,
@@ -236,7 +399,7 @@ def collect_npm_evidence(
             issues=(f"project {lock_path.name} is missing; manifest declarations only",),
         )
     if package_manager != "npm":
-        lock_text = _bounded_text(lock_path, max_dependency_file_bytes)
+        lock_text = bounded_text(lock_path, max_dependency_file_bytes)
         graph = (
             parse_yarn_classic(lock_text, declarations=declarations)
             if package_manager == "yarn-classic"
@@ -251,7 +414,7 @@ def collect_npm_evidence(
             f"{package_manager} {graph.lockfile_version} support is positive-evidence only",
             *graph_issues,
         )
-        return NpmEvidence(
+        return DependencyEvidence(
             package_manager=package_manager,
             lockfile_version=graph.lockfile_version,
             lockfile_path=lock_manifest,
@@ -269,16 +432,27 @@ def collect_npm_evidence(
             issues=tuple(sorted(set(positive_issues))),
         )
     adapter = TypeAdapter(dict[str, object])
-    raw = _bounded_json_object(lock_path, max_dependency_file_bytes)
+    raw = bounded_json_object(lock_path, max_dependency_file_bytes)
     raw_version_number = raw.get("lockfileVersion")
+    if raw_version_number == 1:
+        return _collect_package_lock_v1(
+            raw,
+            package_name=package_name,
+            package_manifest=package_manifest,
+            lock_manifest=lock_manifest,
+            declarations=declarations,
+        )
     if raw_version_number not in {2, 3} or not isinstance(raw.get("packages"), dict):
-        raise ValueError("only package-lock versions 2 and 3 with packages are supported")
+        raise ValueError(
+            "only package-lock version 1 with dependencies or versions 2 and 3 "
+            "with packages are supported"
+        )
     lockfile_version = "2" if raw_version_number == 2 else "3"
     packages = adapter.validate_python(raw["packages"])
     dependencies = adapter.validate_python(package_json.get("dependencies", {}))
     dev_dependencies = adapter.validate_python(package_json.get("devDependencies", {}))
     optional_dependencies = adapter.validate_python(package_json.get("optionalDependencies", {}))
-    instances: list[NpmInstance] = []
+    instances: list[DependencyInstance] = []
     issues: list[str] = []
     manifest_paths = {package_manifest, lock_manifest}
     dependency_consumers: set[str] = set()
@@ -322,38 +496,43 @@ def collect_npm_evidence(
         name_matches = entry_name == package_name
         if entry.get("link") is True and path_matches:
             resolved = entry.get("resolved")
-            if not isinstance(resolved, str):
+            if isinstance(resolved, str):
+                target_path = PurePath(resolved)
+                target = target_path.as_posix().removeprefix("./")
+                if (
+                    not target_path.is_absolute()
+                    and ".." not in target_path.parts
+                    and target in packages
+                ):
+                    target_entry = adapter.validate_python(packages[target])
+                    target_name = target_entry.get("name")
+                    target_version = target_entry.get("version")
+                    if (
+                        target_name == package_name
+                        and isinstance(target_version, str)
+                        and SEMVER.fullmatch(target_version) is not None
+                        and (project_root / target).is_dir()
+                    ):
+                        if target in resolved_workspace_targets:
+                            continue
+                        resolved_workspace_targets.add(target)
+                        manifest_paths.add(f"{prefix}{target}/package.json")
+                        instances.append(
+                            DependencyInstance(
+                                path=raw_path,
+                                version=target_version,
+                                relationship="workspace",
+                                comparable=True,
+                                source_kind="workspace",
+                                source_locator=target,
+                            )
+                        )
+                        continue
+                    issues.append(f"invalid workspace target: {raw_path}")
+                else:
+                    issues.append(f"unresolved workspace link: {raw_path}")
+            else:
                 issues.append(f"unresolved workspace link: {raw_path}")
-                continue
-            target_path = PurePath(resolved)
-            target = target_path.as_posix().removeprefix("./")
-            if target_path.is_absolute() or ".." in target_path.parts or target not in packages:
-                issues.append(f"unresolved workspace link: {raw_path}")
-                continue
-            target_entry = adapter.validate_python(packages[target])
-            target_name = target_entry.get("name")
-            target_version = target_entry.get("version")
-            if (
-                target_name != package_name
-                or not isinstance(target_version, str)
-                or SEMVER.fullmatch(target_version) is None
-                or not (project_root / target).is_dir()
-            ):
-                issues.append(f"invalid workspace target: {raw_path}")
-                continue
-            if target in resolved_workspace_targets:
-                continue
-            resolved_workspace_targets.add(target)
-            manifest_paths.add(f"{prefix}{target}/package.json")
-            instances.append(
-                NpmInstance(
-                    path=raw_path,
-                    version=target_version,
-                    relationship="workspace",
-                    comparable=True,
-                )
-            )
-            continue
         if raw_path in resolved_workspace_targets:
             continue
         if name_matches and not path_matches and "/node_modules/" not in f"/{raw_path}":
@@ -371,6 +550,9 @@ def collect_npm_evidence(
             comparable = False
             issues.append(f"unsupported linked instance: {raw_path}")
         resolved_source = entry.get("resolved")
+        source_kind, source_locator = _npm_source_metadata(raw_version, resolved_source)
+        if entry.get("link") is True and isinstance(resolved_source, str):
+            source_kind = "path"
         external_resolved = False
         if isinstance(resolved_source, str):
             if resolved_source.startswith(("git+", "git://", "ssh://", "file:")):
@@ -410,12 +592,14 @@ def collect_npm_evidence(
         else:
             relationship = "transitive"
         instances.append(
-            NpmInstance(
+            DependencyInstance(
                 path=raw_path,
                 version=raw_version if isinstance(raw_version, str) else None,
                 relationship=relationship,
                 comparable=comparable,
                 development_only=entry.get("dev") is True,
+                source_kind=source_kind,
+                source_locator=source_locator,
             )
         )
         if not comparable:
@@ -462,7 +646,7 @@ def collect_npm_evidence(
             "dependency_consumers_complete",
             "development_scope",
         )
-    return NpmEvidence(
+    return DependencyEvidence(
         package_manager="npm",
         lockfile_version=lockfile_version,
         lockfile_path=lock_manifest,

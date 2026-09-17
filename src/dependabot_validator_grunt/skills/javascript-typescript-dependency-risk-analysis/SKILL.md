@@ -1,9 +1,9 @@
 ---
-name: dependency-risk-analysis
-description: Test Dependabot applicability using bounded repository evidence.
+name: javascript-typescript-dependency-risk-analysis
+description: Test JavaScript and TypeScript dependency applicability using bounded repository evidence.
 ---
 
-# Dependency Risk Analysis
+# JavaScript and TypeScript Dependency Risk Analysis
 
 ## Dependencies
 

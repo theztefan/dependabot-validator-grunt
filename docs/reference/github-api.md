@@ -4,7 +4,7 @@ Read this page only when changing live collection. Current workflow behavior
 and permissions remain authoritative in
 [`../workflow-contract.md`](../workflow-contract.md).
 
-The live adapter uses the public GitHub Enterprise Cloud REST API documented at
+The live adapter uses the publicly documented GitHub Enterprise Cloud REST API at
 <https://docs.github.com/en/enterprise-cloud@latest/rest>. It sends
 `X-GitHub-Api-Version: 2026-03-10` and performs only these GET operations:
 
@@ -38,14 +38,21 @@ lets the HTTP library rebuild transport-managed headers.
 The adapter resolves the default branch to a 40-character commit SHA and
 downloads the tarball for that exact commit. Extraction:
 
-- rejects absolute paths, traversal, duplicate normalized paths, and root
-  escapes;
+- rejects absolute paths, traversal, selected-dependency path collisions, and
+  root escapes;
 - accepts only directories and regular files;
-- excludes links, special files, credentials, and repository-provided agent
-  controls;
+- excludes links, special files, credentials, repository-provided agent
+  controls, ordinary oversized files, and every member of a normalized
+  case-insensitive path collision;
 - applies member-count, per-file, dependency-file, downloaded-byte, and
   expanded-byte limits;
 - does not apply archive ownership, modes, timestamps, or link metadata;
 - makes the completed snapshot read-only.
 
 The temporary source tree is removed after report or failure publication.
+
+The larger dependency-file allowance applies only to contracted dependency
+paths: npm lockfiles and manifests, `pyproject.toml`, `poetry.lock`, `uv.lock`,
+and the exact alert-selected pip requirements input. Unrelated `.txt` files
+retain the ordinary per-file limit. If an excluded path prevents complete
+repository coverage, negative reference evidence remains insufficient.

@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-09-01
-- **Amended by:** ADR 0003
+- **Superseded by:** ADR 0003's tool-less analyst replacement
 
 ## Context
 

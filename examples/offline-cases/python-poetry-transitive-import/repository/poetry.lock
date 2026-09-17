@@ -1,0 +1,17 @@
+[[package]]
+name = "transport-parent"
+version = "1.4.0"
+optional = false
+groups = ["main"]
+
+[package.dependencies]
+requests = ">=2.0,<3.0"
+
+[[package]]
+name = "requests"
+version = "2.31.0"
+optional = false
+groups = ["main"]
+
+[metadata]
+lock-version = "2.1"

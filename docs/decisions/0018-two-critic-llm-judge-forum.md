@@ -20,7 +20,7 @@ After a real investigator finding validates, run one no-tool judge turn with:
 
 The judge may accept the original finding unchanged or replace it with another
 complete permitted finding using only the primary attempt's validated
-observations. Trusted Python validates judge identity, critic consistency,
+observations. Trusted application code validates judge identity, critic consistency,
 permissions, citations, and the selected finding. Deterministic reconciliation
 remains final authority.
 
@@ -30,6 +30,6 @@ invoke neither model.
 
 ## Consequences
 
-- Agentic routes gain two adversarial perspectives with one compact model call.
+- Investigator routes gain two adversarial perspectives with one compact model call.
 - The judge cannot create repository evidence or become a publication gate.
 - Primary and replacement findings remain separately inspectable.

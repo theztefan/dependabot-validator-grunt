@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
+import dependabot_validator_grunt.npm as npm_module
 from dependabot_validator_grunt.agentic import RepositoryTools
 from dependabot_validator_grunt.copilot import ScriptedModelTurn
 from dependabot_validator_grunt.judge import JudgedModelTurn
@@ -178,7 +179,7 @@ async def test_triage_result_union_and_artifacts(
     result = report["result"]
     assert isinstance(result, dict)
     assert report["workflow_mode"] == "triage"
-    assert report["report_schema_version"] == "1.3"
+    assert report["report_schema_version"] == "3.0"
     assert result["assessment"] == assessment
     assert result["priority"] == priority
     assert result["recommended_action"] == action
@@ -208,7 +209,7 @@ async def test_triage_persists_judge_review_artifact(tmp_path: Path) -> None:
     case = CASES / "triage-vulnerable"
     model_turn = JudgedModelTurn(
         ScriptedModelTurn(case / "agent-response.json"),
-        _AcceptingJudge(),
+        lambda: _AcceptingJudge(),
     )
 
     output = await triage_offline_fixture(case, tmp_path, model_turn=model_turn)
@@ -225,7 +226,7 @@ async def test_triage_preserves_primary_finding_when_judge_replaces(
     case = CASES / "triage-vulnerable"
     model_turn = JudgedModelTurn(
         ScriptedModelTurn(case / "agent-response.json"),
-        _ReplacingJudge(),
+        lambda: _ReplacingJudge(),
     )
 
     output = await triage_offline_fixture(case, tmp_path, model_turn=model_turn)
@@ -280,6 +281,8 @@ def test_valid_workspace_link_resolves_once(tmp_path: Path) -> None:
     assert len(evidence.instances) == 1
     assert evidence.instances[0].relationship == "workspace"
     assert evidence.instances[0].version == "2.0.0"
+    assert evidence.instances[0].source_kind == "workspace"
+    assert evidence.instances[0].source_locator == "packages/workspace-package"
     assert "packages/workspace-package/package.json" in evidence.manifest_paths
     packages = TypeAdapter(dict[str, object]).validate_python(lock["packages"])
     packages["packages/app/node_modules/workspace-package"] = {
@@ -314,6 +317,137 @@ def test_root_dependency_relationships(manifest_key: str, expected: str, tmp_pat
     assert evidence.instances[0].relationship == expected
 
 
+def test_package_lock_v1_provides_positive_only_nested_instances(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "package.json").write_text(
+        '{"dependencies":{"lodash":"4.17.20","parent":"1.0.0"}}',
+        encoding="utf-8",
+    )
+    lock = {
+        "lockfileVersion": 1,
+        "dependencies": {
+            "lodash": {
+                "version": "4.17.20",
+                "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz",
+            },
+            "parent": {
+                "version": "1.0.0",
+                "dependencies": {
+                    "lodash": {
+                        "version": "4.17.19",
+                        "resolved": ("https://registry.npmjs.org/lodash/-/lodash-4.17.19.tgz"),
+                    }
+                },
+            },
+        },
+    }
+    (repository / "package-lock.json").write_text(json.dumps(lock), encoding="utf-8")
+
+    evidence = collect_npm_evidence(repository, "lodash")
+
+    assert evidence.lockfile_version == "1"
+    assert evidence.proof_capabilities == ("resolved_instances",)
+    assert evidence.completeness == "partial"
+    assert [
+        (instance.path, instance.version, instance.relationship) for instance in evidence.instances
+    ] == [
+        ("node_modules/lodash", "4.17.20", "direct"),
+        ("node_modules/parent/node_modules/lodash", "4.17.19", "transitive"),
+    ]
+    assert evidence.dependency_consumers == ("node_modules/parent",)
+    assert evidence.issues == ("package-lock 1 support is positive-evidence only",)
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit", "message"),
+    (
+        ("_PACKAGE_LOCK_V1_MAX_TRAVERSAL_STEPS", 3, "traversal step count"),
+        ("_PACKAGE_LOCK_V1_MAX_MATCHING_INSTANCES", 1, "matching instance count"),
+        ("_PACKAGE_LOCK_V1_MAX_CONSUMERS", 1, "consumer count"),
+        ("_PACKAGE_LOCK_V1_MAX_SERIALIZED_OUTPUT_BYTES", 256, "serialized evidence"),
+    ),
+)
+def test_package_lock_v1_branching_bounds_fail_closed(
+    limit_name: str,
+    limit: int,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "package.json").write_text(
+        '{"dependencies":{"parent-a":"1.0.0","parent-b":"1.0.0"}}',
+        encoding="utf-8",
+    )
+    lock = {
+        "lockfileVersion": 1,
+        "dependencies": {
+            "parent-a": {
+                "version": "1.0.0",
+                "dependencies": {
+                    "lodash": {
+                        "version": "4.17.20",
+                        "resolved": ("https://registry.npmjs.org/lodash/-/lodash-4.17.20.tgz"),
+                    }
+                },
+            },
+            "parent-b": {
+                "version": "1.0.0",
+                "dependencies": {
+                    "lodash": {
+                        "version": "4.17.19",
+                        "resolved": ("https://registry.npmjs.org/lodash/-/lodash-4.17.19.tgz"),
+                    }
+                },
+            },
+        },
+    }
+    (repository / "package-lock.json").write_text(json.dumps(lock), encoding="utf-8")
+    monkeypatch.setattr(npm_module, limit_name, limit)
+
+    with pytest.raises(ValueError, match=message):
+        collect_npm_evidence(repository, "lodash")
+
+
+@pytest.mark.parametrize(
+    "resolved",
+    (
+        "https://example.invalid/lodash.tgz",
+        "HTTPS://example.invalid/lodash.tgz",
+        None,
+        123,
+    ),
+)
+def test_package_lock_v1_non_registry_instance_has_no_positive_authority(
+    resolved: object,
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "package.json").write_text(
+        '{"dependencies":{"lodash":"4.17.20"}}',
+        encoding="utf-8",
+    )
+    lock = {
+        "lockfileVersion": 1,
+        "dependencies": {
+            "lodash": {
+                "version": "4.17.20",
+                "resolved": resolved,
+            }
+        },
+    }
+    (repository / "package-lock.json").write_text(json.dumps(lock), encoding="utf-8")
+
+    evidence = collect_npm_evidence(repository, "lodash")
+
+    assert evidence.proof_capabilities == ()
+    assert evidence.instances[0].comparable is False
+    assert "uncomparable instance: node_modules/lodash" in evidence.issues
+
+
 def test_transitive_and_workspace_owned_relationships(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     workspace = repository / "packages" / "app"
@@ -341,18 +475,28 @@ def test_transitive_and_workspace_owned_relationships(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "entry",
+    ("entry", "source_kind"),
     [
-        {"version": "4.17.20", "resolved": "git+ssh://git@example.invalid/repo.git"},
-        {"version": "4.17.20", "resolved": "https://example.invalid/lodash.tgz"},
-        {
-            "version": "4.17.20",
-            "resolved": "https://evil.example/registry.npmjs.org/lodash.tgz",
-        },
-        {"resolved": "../outside", "link": True},
+        (
+            {"version": "4.17.20", "resolved": "git+ssh://git@example.invalid/repo.git"},
+            "vcs",
+        ),
+        ({"version": "4.17.20", "resolved": "https://example.invalid/lodash.tgz"}, "url"),
+        (
+            {
+                "version": "4.17.20",
+                "resolved": "https://evil.example/registry.npmjs.org/lodash.tgz",
+            },
+            "url",
+        ),
+        ({"version": "file:../lodash", "resolved": "file:../lodash"}, "path"),
     ],
 )
-def test_unsupported_sources_and_links(entry: dict[str, object], tmp_path: Path) -> None:
+def test_unsupported_external_sources_preserve_provenance(
+    entry: dict[str, object],
+    source_kind: str,
+    tmp_path: Path,
+) -> None:
     repository = tmp_path / "repository"
     repository.mkdir()
     (repository / "package.json").write_text(
@@ -365,6 +509,33 @@ def test_unsupported_sources_and_links(entry: dict[str, object], tmp_path: Path)
     (repository / "package-lock.json").write_text(json.dumps(lock), encoding="utf-8")
     evidence = collect_npm_evidence(repository, "lodash")
     assert evidence.completeness == "unsupported"
+    assert len(evidence.instances) == 1
+    assert evidence.instances[0].source_kind == source_kind
+    assert evidence.instances[0].source_locator == entry["resolved"]
+
+
+def test_unsupported_external_link_preserves_path_provenance(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "package.json").write_text(
+        '{"dependencies":{"lodash":"4.17.20"}}', encoding="utf-8"
+    )
+    lock = {
+        "lockfileVersion": 3,
+        "packages": {
+            "": {},
+            "node_modules/lodash": {"resolved": "packages/missing", "link": True},
+        },
+    }
+    (repository / "package-lock.json").write_text(json.dumps(lock), encoding="utf-8")
+
+    evidence = collect_npm_evidence(repository, "lodash")
+
+    assert evidence.completeness == "unsupported"
+    assert len(evidence.instances) == 1
+    assert not evidence.instances[0].comparable
+    assert evidence.instances[0].source_kind == "path"
+    assert evidence.instances[0].source_locator == "packages/missing"
 
 
 def test_malformed_individual_entry_is_partial(tmp_path: Path) -> None:
@@ -425,6 +596,7 @@ def test_root_hoisted_transitive_relationship(tmp_path: Path) -> None:
     evidence = collect_npm_evidence(repository, "lodash")
     assert evidence.completeness == "complete"
     assert evidence.instances[0].relationship == "transitive"
+    assert evidence.instances[0].source_kind == "registry"
 
 
 async def test_triage_alert_drift_fails_without_report(tmp_path: Path) -> None:

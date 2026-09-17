@@ -1,0 +1,21 @@
+{
+  "agent_capability_catalog_version": "1.0",
+  "capabilities": [
+    {
+      "capability_id": "javascript-typescript-v1",
+      "capability_version": "1.3.0",
+      "ecosystems": ["npm"],
+      "analyzer_profile": "npm",
+      "skill_asset": "skills/javascript-typescript-dependency-risk-analysis/SKILL.md",
+      "skill_name": "javascript-typescript-dependency-risk-analysis"
+    },
+    {
+      "capability_id": "python-v1",
+      "capability_version": "1.2.0",
+      "ecosystems": ["pip", "uv"],
+      "analyzer_profile": "python",
+      "skill_asset": "skills/python-dependency-risk-analysis/SKILL.md",
+      "skill_name": "python-dependency-risk-analysis"
+    }
+  ]
+}

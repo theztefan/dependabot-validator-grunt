@@ -3,6 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-09-14
 - **Amends:** ADR 0003, ADR 0009, ADR 0010, ADR 0017, and ADR 0018
+- **Amended by:** ADR 0021
 
 ## Context
 
@@ -14,7 +15,7 @@ negative security conclusions.
 
 ## Decision
 
-- Keep collection in trusted Python; never execute npm, Yarn, pnpm, Corepack,
+- Keep collection in trusted application code; never execute npm, Yarn, pnpm, Corepack,
   lifecycle scripts, repository configuration, or network requests.
 - Dispatch by the selected manifest basename and normalize supported managers
   into one dependency graph with explicit provenance and proof capabilities.

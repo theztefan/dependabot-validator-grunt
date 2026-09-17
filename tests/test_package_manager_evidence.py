@@ -7,12 +7,15 @@ import shutil
 from pathlib import Path
 
 import pytest
+from python_dependency_test_support import (
+    CASES,
+)
 
 from dependabot_validator_grunt.npm import collect_npm_evidence
-from dependabot_validator_grunt.workflow import WorkflowError, triage_offline_fixture
-
-ROOT = Path(__file__).parents[1]
-CASES = ROOT / "examples" / "offline-cases"
+from dependabot_validator_grunt.workflow import (
+    WorkflowError,
+    triage_offline_fixture,
+)
 
 
 def test_yarn_classic_direct_instance_is_positive_partial_evidence(tmp_path: Path) -> None:
@@ -47,6 +50,7 @@ fflate@^0.4.8:
     assert [(instance.version, instance.relationship) for instance in evidence.instances] == [
         ("2.5.1", "direct")
     ]
+    assert evidence.instances[0].source_kind == "registry"
 
 
 def test_yarn_classic_records_transitive_consumers_and_shared_selectors(
@@ -91,15 +95,16 @@ def test_yarn_classic_rejects_conflicts_and_unknown_versions(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize(
-    "resolved",
+    ("resolved", "source_kind"),
     (
-        "",
-        '  resolved "git+https://github.com/example/target.git"',
-        '  resolved "https://example.com/target-1.0.0.tgz"',
+        ("", "unknown"),
+        ('  resolved "git+https://github.com/example/target.git"', "vcs"),
+        ('  resolved "https://example.com/target-1.0.0.tgz"', "url"),
     ),
 )
 def test_yarn_classic_requires_registry_backed_instances(
     resolved: str,
+    source_kind: str,
     tmp_path: Path,
 ) -> None:
     (tmp_path / "package.json").write_text(
@@ -120,6 +125,7 @@ target@1.0.0:
 
     assert len(evidence.instances) == 1
     assert not evidence.instances[0].comparable
+    assert evidence.instances[0].source_kind == source_kind
     assert evidence.proof_capabilities == ()
 
 
@@ -200,19 +206,37 @@ snapshots:
     assert not any("unresolved target dependency edge" in issue for issue in evidence.issues)
 
 
-@pytest.mark.parametrize("version", ("workspace:*", "file:../target", "github:user/repo"))
+@pytest.mark.parametrize(
+    ("version", "source_kind"),
+    (
+        ("workspace:*", "workspace"),
+        ("file:../target", "path"),
+        ("github:user/repo", "vcs"),
+        ("https://example.com/target.tgz", "url"),
+    ),
+)
 def test_pnpm_v9_non_registry_versions_are_not_comparable(
     version: str,
+    source_kind: str,
     tmp_path: Path,
 ) -> None:
-    (tmp_path / "package.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "package.json").write_text(
+        json.dumps({"dependencies": {"target": version}}),
+        encoding="utf-8",
+    )
     (tmp_path / "pnpm-lock.yaml").write_text(
         f"""lockfileVersion: '9.0'
-importers: {{'.': {{}}}}
+importers:
+  .:
+    dependencies:
+      target:
+        specifier: {version}
+        version: {version}
 packages:
   target@{version}:
     resolution: {{integrity: sha512-target}}
-snapshots: {{}}
+snapshots:
+  target@{version}: {{}}
 """,
         encoding="utf-8",
     )
@@ -220,19 +244,22 @@ snapshots: {{}}
     evidence = collect_npm_evidence(tmp_path, "target", "pnpm-lock.yaml")
 
     assert evidence.proof_capabilities == ()
-    assert all(not instance.comparable for instance in evidence.instances)
+    assert len(evidence.instances) == 1
+    assert not evidence.instances[0].comparable
+    assert evidence.instances[0].source_kind == source_kind
 
 
 @pytest.mark.parametrize(
-    "resolution",
+    ("resolution", "source_kind"),
     (
-        "{}",
-        "{directory: ../target}",
-        "{tarball: https://example.com/target-1.0.0.tgz}",
+        ("{}", "unknown"),
+        ("{directory: ../target}", "path"),
+        ("{tarball: https://example.com/target-1.0.0.tgz}", "url"),
     ),
 )
 def test_pnpm_v9_requires_registry_resolution(
     resolution: str,
+    source_kind: str,
     tmp_path: Path,
 ) -> None:
     (tmp_path / "package.json").write_text(
@@ -260,6 +287,7 @@ snapshots:
 
     assert len(evidence.instances) == 1
     assert not evidence.instances[0].comparable
+    assert evidence.instances[0].source_kind == source_kind
     assert evidence.proof_capabilities == ()
 
 
@@ -484,8 +512,11 @@ async def test_partial_lockfiles_cannot_authorize_agentic_negative_proofs(
     alert = json.loads((case / "alert.json").read_text(encoding="utf-8"))
     alert["manifest_path"] = lockfile_name
     (case / "alert.json").write_text(json.dumps(alert), encoding="utf-8")
-    response = {
-        "tool_calls": [{"name": "search", "arguments": {"query": "lodash", "path": "."}}],
+    response: dict[str, object] = {
+        "tool_calls": [
+            {"name": "analyze_reachability", "arguments": {}},
+            {"name": "search", "arguments": {"query": "lodash", "path": "."}},
+        ],
         "finding": {
             "workflow_mode": "$task.workflow_mode",
             "correlation_id": "$task.correlation_id",

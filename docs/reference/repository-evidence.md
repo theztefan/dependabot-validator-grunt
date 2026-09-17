@@ -11,11 +11,17 @@ of normalized paths and file contents. Live runs resolve the default branch to
 one commit SHA and extract the tarball for that SHA into a temporary read-only
 directory.
 
-The extractor rejects path traversal, absolute paths, duplicate normalized
-paths, links, devices, FIFOs, and root escapes. Credential-like files and
-repository-provided agent, instruction, hook, plugin, and MCP controls are
-excluded. `.github/workflows/**` and `.github/actions/**` remain readable
-because they can affect dependency execution.
+The extractor rejects path traversal, absolute paths, selected dependency
+inputs beneath normalized path collisions, links, devices, FIFOs, and root
+escapes. Ordinary oversized files and every descendant of a case-insensitive
+Unicode-normalized path collision are excluded and recorded as incomplete
+coverage. Credential-like files and repository-provided agent, instruction,
+hook, plugin, and MCP controls are also excluded. `.github/workflows/**` and
+`.github/actions/**` remain readable because they can affect dependency
+execution.
+
+Coverage exclusions cannot invalidate positive observations from included
+files, but they prevent repository-wide sufficient-absence proof.
 
 ## Agent reads
 
@@ -35,7 +41,7 @@ attempt-local cache. Each retry receives a fresh cache and content budget.
 
 ## Repository reference evidence
 
-When a task may propose `vulnerable_symbol_unused`, trusted Python performs a
+When a task may propose `vulnerable_symbol_unused`, trusted application code performs a
 bounded package-identifier scan before model dispatch.
 
 The scan considers readable UTF-8 repository text without relying on a source
@@ -46,7 +52,7 @@ keeps scripts and tool configuration searchable.
 The result is one of:
 
 - `reference_found`: at least one package reference exists;
-- `complete_absence`: every candidate was processed and no reference exists;
+- `sufficient_absence`: every candidate was processed and no reference exists;
 - `insufficient`: coverage was incomplete or unsafe.
 
 A positive reference remains useful even if the scan later reaches a limit.
@@ -69,4 +75,5 @@ Default limits are:
 | Results from one list or search call | 200 |
 
 Archive and dependency-file limits are documented in
-[`live-ghec.md`](live-ghec.md) and [`npm-evidence.md`](npm-evidence.md).
+[`github-api.md`](github-api.md), [`npm-evidence.md`](npm-evidence.md), and
+[`python-evidence.md`](python-evidence.md).

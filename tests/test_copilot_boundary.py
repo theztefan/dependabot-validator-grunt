@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from importlib.resources.abc import Traversable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Literal, cast
 
 import pytest
 from copilot import PermissionRequest, Tool, ToolInvocation
@@ -31,21 +31,29 @@ from pydantic import ValidationError
 
 import dependabot_validator_grunt.copilot as copilot_module
 import dependabot_validator_grunt.copilot_assets as assets_module
+from dependabot_validator_grunt.agent_capabilities import (
+    InvestigatorCapability,
+    select_investigator_capability,
+)
 from dependabot_validator_grunt.agentic import RepositoryTools
 from dependabot_validator_grunt.copilot import (
     DISABLED_BUILTIN_SKILLS,
     CopilotFindingJudge,
     CopilotModelTurn,
     CopilotTurnError,
+    ScriptedModelTurn,
     SessionAssetObserver,
     allowlisted_copilot_environment,
     parse_model_output,
     reject_permission_request,
+    validate_task_reachability,
 )
 from dependabot_validator_grunt.copilot_assets import (
     AGENT_MANIFEST_ASSET,
     AGENT_NAME,
     AGENT_PROMPT_ASSET,
+    JAVASCRIPT_TYPESCRIPT_SKILL_ASSET,
+    JAVASCRIPT_TYPESCRIPT_SKILL_NAME,
     JUDGE_AGENT_MANIFEST_ASSET,
     JUDGE_AGENT_NAME,
     JUDGE_AGENT_PROMPT_ASSET,
@@ -53,29 +61,44 @@ from dependabot_validator_grunt.copilot_assets import (
     JUDGE_SKILL_ASSET,
     JUDGE_SKILL_NAME,
     JUDGE_SYSTEM_PROMPT_ASSET,
+    MAX_RENDERED_TASK_PROMPT_CHARACTERS,
     MAX_STATIC_INSTRUCTION_CHARACTERS,
     PROMPT_TEMPLATE_ASSET,
-    SKILL_ASSET,
+    PYTHON_SKILL_NAME,
     SYSTEM_PROMPT_ASSET,
     TOOL_DEFINITIONS_ASSET,
     TOOL_NAMES,
     CopilotConfigurationError,
-    load_copilot_assets,
+    load_investigator_assets,
     load_judge_assets,
     materialized_skill_root,
     render_task_prompt,
 )
 from dependabot_validator_grunt.copilot_tools import repository_sdk_tools
 from dependabot_validator_grunt.models import (
+    MAX_AGENT_TASK_CHARACTERS,
+    PYTHON_REACHABILITY_OPERATIONS,
     AgentFinding,
     AgentProposalPermission,
     AgentTask,
+    AgentTaskSizeError,
     AlertSnapshot,
+    DependencyPath,
+    DependencyPathNode,
+    ImportTarget,
     JudgeFailure,
     JudgeReview,
+    ReachabilityEvidence,
     RepositoryReferenceEvidence,
 )
 from dependabot_validator_grunt.workflow import review_offline_fixture
+
+
+def _investigator_assets(
+    ecosystem: Literal["npm", "pip", "uv"] = "npm",
+) -> assets_module.CopilotRoleAssets:
+    return load_investigator_assets(select_investigator_capability(ecosystem))
+
 
 ROOT = Path(__file__).parents[1]
 CASES = ROOT / "examples" / "offline-cases"
@@ -96,6 +119,7 @@ def _task() -> AgentTask:
         dismissal_reason="not_used",
         snapshot_id="snapshot",
         policy_digest="policy",
+        package_name="lodash",
         permitted_proposals=(
             AgentProposalPermission(
                 recommendation="deny",
@@ -107,6 +131,31 @@ def _task() -> AgentTask:
             ),
         ),
     )
+
+
+async def test_scripted_turn_loads_current_investigator_assets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = tmp_path / "agent-response.json"
+    response.write_text("{}", encoding="utf-8")
+    loaded_capabilities: list[str] = []
+    original_loader = copilot_module.load_investigator_assets
+
+    def load_assets(capability: InvestigatorCapability) -> assets_module.CopilotRoleAssets:
+        loaded_capabilities.append(capability.capability_id)
+        return original_loader(capability)
+
+    monkeypatch.setattr(copilot_module, "load_investigator_assets", load_assets)
+
+    await ScriptedModelTurn(response).run(
+        _task(),
+        RepositoryTools(tmp_path),
+        max_attempts=1,
+        wall_clock_seconds=1,
+    )
+
+    assert loaded_capabilities == ["javascript-typescript-v1"]
 
 
 def _finding(task: AgentTask) -> str:
@@ -124,8 +173,48 @@ def _finding(task: AgentTask) -> str:
                 "citations": [],
                 "uncertainty": "No repository fact was cited.",
                 "proposed_recommendation": "human_review",
+                "policy_reason_code": "insufficient_context",
+                "confidence": 0.5,
+                "insufficient_context": True,
+                "injection_detected": False,
             }
         }
+    )
+
+
+def _python_task() -> AgentTask:
+    return AgentTask(
+        workflow_mode="triage",
+        correlation_id="correlation",
+        repository_id="owner/repository",
+        alert_number=7,
+        snapshot_id="snapshot",
+        policy_digest="policy",
+        ecosystem="pip",
+        package_name="requests",
+        package_identity="requests",
+        vulnerable_range="<2.32.0",
+        manifest_path="requirements.txt",
+        dependency_package_manager="pip",
+        dependency_version_scheme="pep440",
+        dependency_completeness="partial",
+        import_targets=(
+            ImportTarget(
+                value="requests",
+                provenance="canonical_distribution",
+                authoritative=True,
+            ),
+        ),
+        permitted_proposals=(
+            AgentProposalPermission(
+                recommendation="deny",
+                reason_codes=("advisory_applies",),
+            ),
+            AgentProposalPermission(
+                recommendation="human_review",
+                reason_codes=("insufficient_context",),
+            ),
+        ),
     )
 
 
@@ -202,6 +291,13 @@ def test_agent_task_requires_unambiguous_nonempty_proposals() -> None:
                 ],
             }
         )
+    python_task = _python_task().model_dump(mode="json")
+    python_task["permitted_proposals"] = [
+        {"recommendation": "approve", "reason_codes": ["vulnerable_symbol_unused"]},
+        {"recommendation": "human_review", "reason_codes": ["insufficient_context"]},
+    ]
+    with pytest.raises(ValidationError, match="cannot permit approval"):
+        AgentTask.model_validate(python_task)
 
 
 def test_agent_task_reference_evidence_is_serializable_and_identity_bound() -> None:
@@ -361,7 +457,12 @@ class FakeSession:
         self.captured["prompt"] = prompt
         self.captured["timeout"] = options["timeout"]
         for invocation_number in range(self.reachability_invocations if self.tools else 0):
-            analyzer = next(tool for tool in self.tools if tool.name == "analyze_reachability")
+            analyzer = next(
+                (tool for tool in self.tools if tool.name == "analyze_reachability"),
+                None,
+            )
+            if analyzer is None:
+                break
             assert analyzer.handler is not None
             result = analyzer.handler(
                 ToolInvocation(
@@ -399,10 +500,12 @@ class FakeClient:
     list_models_error: BaseException | None = None
     skill_source = SkillSource.CUSTOM
     agent_source = "custom"
+    reported_agent_name: str | None = None
     emit_agent_event = True
     emit_selected_event = True
     emit_skill_event = True
     deselect_agent = False
+    reported_extra_tool: str | None = None
     final_agent_id: str | None = "custom-agent-id"
     reachability_invocations = 1
 
@@ -436,8 +539,13 @@ class FakeClient:
         assert len(custom_agents) == 1
         selected_agent = custom_agents[0]
         agent_name = cast(str, selected_agent["name"])
+        reported_agent_name = self.reported_agent_name or agent_name
         agent_display_name = cast(str, selected_agent["display_name"])
         agent_tools = cast(list[str], selected_agent["tools"])
+        reported_tools = [
+            *agent_tools,
+            *([self.reported_extra_tool] if self.reported_extra_tool is not None else []),
+        ]
         agent_skills = cast(list[str], selected_agent["skills"])
         assert len(agent_skills) == 1
         skill_name = agent_skills[0]
@@ -453,9 +561,9 @@ class FakeClient:
                                 description="description",
                                 display_name=agent_display_name,
                                 id="custom-agent-id",
-                                name=agent_name,
+                                name=reported_agent_name,
                                 source=self.agent_source,
-                                tools=agent_tools,
+                                tools=reported_tools,
                                 user_invocable=True,
                             )
                         ],
@@ -471,8 +579,8 @@ class FakeClient:
                     type=SessionEventType.SUBAGENT_SELECTED,
                     data=SubagentSelectedData(
                         agent_display_name=agent_display_name,
-                        agent_name=agent_name,
-                        tools=agent_tools,
+                        agent_name=reported_agent_name,
+                        tools=reported_tools,
                     ),
                 ),
             )
@@ -529,10 +637,12 @@ def fake_sdk(monkeypatch: pytest.MonkeyPatch) -> type[FakeClient]:
     FakeClient.list_models_error = None
     FakeClient.skill_source = SkillSource.CUSTOM
     FakeClient.agent_source = "custom"
+    FakeClient.reported_agent_name = None
     FakeClient.emit_agent_event = True
     FakeClient.emit_selected_event = True
     FakeClient.emit_skill_event = True
     FakeClient.deselect_agent = False
+    FakeClient.reported_extra_tool = None
     FakeClient.final_agent_id = "custom-agent-id"
     FakeClient.reachability_invocations = 1
     monkeypatch.setattr(copilot_module, "CopilotClient", FakeClient)
@@ -595,7 +705,7 @@ async def test_real_boundary_passes_least_privilege_session_options(
     assert client.session["on_permission_request"] is reject_permission_request
     assert client.session["system_message"] == {
         "mode": "append",
-        "content": turn.assets.system_prompt,
+        "content": _investigator_assets().system_prompt,
     }
     for name in (
         "enable_config_discovery",
@@ -616,14 +726,15 @@ async def test_real_boundary_passes_least_privilege_session_options(
     assert client.session["mcp_servers"] == {}
     assert client.session["memory"] == {"enabled": False}
     assert client.session["agent"] == AGENT_NAME
+    selected_assets = load_investigator_assets(select_investigator_capability(task.ecosystem))
     assert client.session["custom_agents"] == [
         {
             "name": AGENT_NAME,
             "display_name": "Dependency Risk Investigator",
-            "description": "Read-only analysis of Dependabot dismissal and triage evidence.",
-            "prompt": turn.assets.agent_prompt,
+            "description": "Read-only ecosystem-selected analysis of Dependabot evidence.",
+            "prompt": selected_assets.agent_prompt,
             "tools": list(TOOL_NAMES),
-            "skills": ["dependency-risk-analysis"],
+            "skills": ["javascript-typescript-dependency-risk-analysis"],
             "infer": False,
         }
     ]
@@ -713,13 +824,88 @@ async def test_judge_boundary_passes_no_tool_session_options(
     assert "do-not-copy" not in prompt
 
 
+async def test_python_boundary_uses_python_agent_and_four_tools(
+    fake_sdk: type[FakeClient],
+    tmp_path: Path,
+) -> None:
+    task = _python_task()
+    response = _finding(task)
+    fake_sdk.responses = iter((response,))
+    turn = CopilotModelTurn("token", model="fake-model")
+
+    result = await turn.run(
+        task,
+        _repository(tmp_path),
+        max_attempts=1,
+        wall_clock_seconds=10,
+    )
+
+    assert "finding" in result
+    client = fake_sdk.instances[0]
+    registered_tools = cast(list[Tool], client.session["tools"])
+    assert client.session["available_tools"] == list(TOOL_NAMES)
+    assert [tool.name for tool in registered_tools] == list(TOOL_NAMES)
+    selected_assets = load_investigator_assets(select_investigator_capability(task.ecosystem))
+    assert client.session["agent"] == AGENT_NAME
+    assert client.session["custom_agents"] == [
+        {
+            "name": AGENT_NAME,
+            "display_name": "Dependency Risk Investigator",
+            "description": "Read-only ecosystem-selected analysis of Dependabot evidence.",
+            "prompt": selected_assets.agent_prompt,
+            "tools": list(TOOL_NAMES),
+            "skills": [PYTHON_SKILL_NAME],
+            "infer": False,
+        }
+    ]
+    assert client.session["default_agent"] == {"excluded_tools": list(TOOL_NAMES)}
+    assert turn.capability_for_task(task).capability_id == "python-v1"
+
+
+async def test_capability_assets_load_lazily_and_cache_by_capability(
+    fake_sdk: type[FakeClient],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    npm_task = _task()
+    python_task = _python_task()
+    fake_sdk.responses = iter(
+        (
+            _finding(npm_task),
+            _finding(npm_task),
+            _finding(python_task),
+            _finding(python_task),
+        )
+    )
+    original_loader = copilot_module.load_investigator_assets
+    loaded: list[str] = []
+
+    def load_assets(
+        capability: InvestigatorCapability,
+    ) -> assets_module.CopilotRoleAssets:
+        loaded.append(capability.capability_id)
+        return original_loader(capability)
+
+    monkeypatch.setattr(copilot_module, "load_investigator_assets", load_assets)
+    turn = CopilotModelTurn("token", model="fake-model")
+    tools = _repository(tmp_path)
+
+    assert loaded == []
+    await turn.run(npm_task, tools, max_attempts=1, wall_clock_seconds=10)
+    await turn.run(npm_task, tools, max_attempts=1, wall_clock_seconds=10)
+    await turn.run(python_task, tools, max_attempts=1, wall_clock_seconds=10)
+    await turn.run(python_task, tools, max_attempts=1, wall_clock_seconds=10)
+
+    assert loaded == ["javascript-typescript-v1", "python-v1"]
+
+
 async def test_judge_boundary_maps_malformed_output_to_failure(
     fake_sdk: type[FakeClient],
     tmp_path: Path,
 ) -> None:
     task = _task()
     finding = AgentFinding.model_validate(json.loads(_finding(task))["finding"])
-    fake_sdk.responses = iter(("not-json",))
+    fake_sdk.responses = iter(("not-json", "still-not-json"))
 
     result = await CopilotFindingJudge("token").review(
         task=task,
@@ -730,6 +916,26 @@ async def test_judge_boundary_maps_malformed_output_to_failure(
 
     failure = JudgeFailure.model_validate(result)
     assert failure.reason == "malformed_output"
+
+
+async def test_judge_boundary_retries_malformed_output(
+    fake_sdk: type[FakeClient],
+    tmp_path: Path,
+) -> None:
+    task = _task()
+    finding = AgentFinding.model_validate(json.loads(_finding(task))["finding"])
+    fake_sdk.responses = iter(("not-json", _judge_review(task)))
+
+    result = await CopilotFindingJudge("token").review(
+        task=task,
+        finding=finding,
+        tools=_repository(tmp_path),
+        timeout_seconds=10,
+    )
+
+    review = JudgeReview.model_validate(result)
+    assert review.verdict == "accept"
+    assert len(fake_sdk.instances) == 2
 
 
 async def test_judge_boundary_rejects_agent_deselection(
@@ -789,6 +995,84 @@ async def test_real_boundary_rejects_response_without_reachability_invocation(
     assert [attempt.outcome for attempt in raised.value.attempts] == ["malformed_output"]
 
 
+async def test_real_python_boundary_requires_reachability_for_authoritative_target(
+    fake_sdk: type[FakeClient],
+    tmp_path: Path,
+) -> None:
+    task = _python_task()
+    fake_sdk.responses = iter((_finding(task),))
+    fake_sdk.reachability_invocations = 0
+
+    with pytest.raises(CopilotTurnError) as raised:
+        await CopilotModelTurn("token").run(
+            task,
+            _repository(tmp_path),
+            max_attempts=1,
+            wall_clock_seconds=10,
+        )
+
+    assert [attempt.outcome for attempt in raised.value.attempts] == ["malformed_output"]
+
+
+async def test_real_python_boundary_allows_no_invocation_without_authoritative_target(
+    fake_sdk: type[FakeClient],
+    tmp_path: Path,
+) -> None:
+    task = _python_task().model_copy(
+        update={
+            "package_name": "django-filter",
+            "package_identity": "django-filter",
+            "import_targets": (),
+        }
+    )
+    fake_sdk.responses = iter((_finding(task),))
+    fake_sdk.reachability_invocations = 0
+
+    result = await CopilotModelTurn("token").run(
+        task,
+        _repository(tmp_path),
+        max_attempts=1,
+        wall_clock_seconds=10,
+    )
+
+    assert "finding" in result
+
+
+async def test_real_python_boundary_rejects_mismatched_analyzer_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    task = _python_task()
+    turn = CopilotModelTurn("token")
+
+    async def run_attempt(
+        prompt: str,
+        attempt_tools: RepositoryTools,
+        assigned_task: AgentTask,
+        remaining_seconds: float,
+    ) -> tuple[str, str | None]:
+        del prompt, remaining_seconds
+        attempt_tools.analyze_reachability(
+            snapshot_id=assigned_task.snapshot_id,
+            package_name=assigned_task.package_name,
+            profile="python",
+            target_identifiers=("urllib3",),
+        )
+        return _finding(assigned_task), "fake-model"
+
+    monkeypatch.setattr(turn, "_run_attempt", run_attempt)
+
+    with pytest.raises(CopilotTurnError) as raised:
+        await turn.run(
+            task,
+            _repository(tmp_path),
+            max_attempts=1,
+            wall_clock_seconds=10,
+        )
+
+    assert [attempt.outcome for attempt in raised.value.attempts] == ["malformed_output"]
+
+
 async def test_real_boundary_accepts_repeated_cached_reachability_invocation(
     fake_sdk: type[FakeClient],
     tmp_path: Path,
@@ -811,7 +1095,7 @@ async def test_real_boundary_allows_citable_denial_when_analyzer_is_unavailable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    task = _task().model_copy(update={"package_name": "lodash"})
+    task = _task().model_copy(update={"package_name": "lodash", "package_identity": "lodash"})
     tools = _repository(tmp_path)
     (tools.root / "app.js").write_text("const lodash = require('lodash')\n", encoding="utf-8")
     turn = CopilotModelTurn("token")
@@ -826,6 +1110,7 @@ async def test_real_boundary_allows_citable_denial_when_analyzer_is_unavailable(
         evidence = attempt_tools.analyze_reachability(
             snapshot_id=assigned_task.snapshot_id,
             package_name=assigned_task.package_name,
+            profile="npm",
         )
         assert evidence.status == "unavailable"
         citations = [
@@ -866,7 +1151,7 @@ async def test_real_boundary_allows_citable_denial_when_analyzer_is_unavailable(
 
 
 def test_copilot_assets_load_explicit_package_files() -> None:
-    assets = load_copilot_assets()
+    assets = _investigator_assets()
 
     assert assets.agent.name == AGENT_NAME
     assert "Dependency Risk Investigator" in assets.agent_prompt
@@ -878,14 +1163,14 @@ def test_copilot_assets_load_explicit_package_files() -> None:
         AGENT_MANIFEST_ASSET,
         AGENT_PROMPT_ASSET,
         PROMPT_TEMPLATE_ASSET,
-        SKILL_ASSET,
+        JAVASCRIPT_TYPESCRIPT_SKILL_ASSET,
         SYSTEM_PROMPT_ASSET,
         TOOL_DEFINITIONS_ASSET,
     } == {
         "agents/dependency-risk-investigator/agent.json",
         "agents/dependency-risk-investigator/prompt.md",
         "prompts/dependency-investigation.md.tmpl",
-        "skills/dependency-risk-analysis/SKILL.md",
+        "skills/javascript-typescript-dependency-risk-analysis/SKILL.md",
         "system-prompts/dependency-risk-session.md",
         "tools/repository-tools.json",
     }
@@ -898,6 +1183,8 @@ def test_judge_assets_load_explicit_package_files() -> None:
     assert assets.agent.tools == ()
     assert assets.agent.skills == (JUDGE_SKILL_NAME,)
     assert "Dependency Risk Judge" in assets.agent_prompt
+    assert '"replacement_finding": null' in assets.agent_prompt
+    assert "Return raw JSON only." in assets.agent_prompt
     assert "<trust_boundary>" in assets.system_prompt
     assert "evidence critic" not in assets.system_prompt.casefold()
     assert "```json\n{{judge_json}}\n```" in assets.prompt_template
@@ -919,16 +1206,89 @@ def test_judge_assets_load_explicit_package_files() -> None:
 
 def test_task_prompt_round_trips_structured_task() -> None:
     task = _task()
-    prompt = render_task_prompt(load_copilot_assets().prompt_template, task)
+    prompt = render_task_prompt(_investigator_assets().prompt_template, task)
 
     assert _task_from_prompt(prompt) == task
     assert prompt.startswith("Analyze this dependency-risk task:\n\n```json\n")
     assert prompt.endswith("\n```\n")
 
 
+def test_python_task_prompt_preserves_bounded_candidate_path_context() -> None:
+    task = _python_task().model_copy(
+        update={
+            "dependency_relationship": "transitive",
+            "dependency_path_count": 1,
+            "dependency_paths": (
+                DependencyPath(
+                    nodes=(
+                        DependencyPathNode(
+                            instance_id="importer:.",
+                            package_name="<project>",
+                        ),
+                        DependencyPathNode(
+                            instance_id="poetry:parent@1",
+                            package_name="parent",
+                            version="1",
+                        ),
+                        DependencyPathNode(
+                            instance_id="poetry:requests@2.31",
+                            package_name="requests",
+                            version="2.31",
+                        ),
+                    ),
+                    edge_kinds=("runtime", "transitive"),
+                    edge_requirements=(">=1", ">=2"),
+                    conditions=(None, None),
+                ),
+            ),
+            "dependency_paths_truncated": True,
+        }
+    )
+
+    prompt = render_task_prompt(_investigator_assets("pip").prompt_template, task)
+    rendered = _task_from_prompt(prompt)
+
+    assert rendered == task
+    assert rendered.dependency_relationship == "transitive"
+    assert rendered.dependency_paths_truncated
+    assert [node.package_name for node in rendered.dependency_paths[0].nodes] == [
+        "<project>",
+        "parent",
+        "requests",
+    ]
+    assert len(prompt) < 128 * 1024
+
+
+def test_agent_task_rejects_aggregate_serialized_payload() -> None:
+    with pytest.raises(AgentTaskSizeError, match=f"{MAX_AGENT_TASK_CHARACTERS} characters"):
+        AgentTask(
+            correlation_id="correlation",
+            repository_id="owner/repository",
+            alert_number=7,
+            request_id="request",
+            dismissal_reason="not_used",
+            snapshot_id="snapshot",
+            policy_digest="policy",
+            advisory_summary="x" * MAX_AGENT_TASK_CHARACTERS,
+            permitted_proposals=(
+                AgentProposalPermission(
+                    recommendation="human_review",
+                    reason_codes=("insufficient_context",),
+                ),
+            ),
+        )
+
+
+def test_task_prompt_rejects_aggregate_rendered_size() -> None:
+    template = ("x" * MAX_RENDERED_TASK_PROMPT_CHARACTERS) + "\n```json\n{{task_json}}\n```\n"
+
+    with pytest.raises(CopilotConfigurationError, match="rendered prompt"):
+        render_task_prompt(template, _task())
+
+
 def test_model_facing_assets_keep_single_responsibilities() -> None:
-    assets = load_copilot_assets()
-    skill = assets_module.read_package_asset(SKILL_ASSET)
+    assets = _investigator_assets()
+    skill = assets_module.read_package_asset(JAVASCRIPT_TYPESCRIPT_SKILL_ASSET)
     judge_assets = load_judge_assets()
     judge_skill = assets_module.read_package_asset(JUDGE_SKILL_ASSET)
 
@@ -944,9 +1304,11 @@ def test_model_facing_assets_keep_single_responsibilities() -> None:
 
 def test_materialized_skill_root_copies_packaged_skill(tmp_path: Path) -> None:
     with materialized_skill_root(tmp_path) as skill_root:
-        skill = skill_root / "dependency-risk-analysis" / "SKILL.md"
+        skill = skill_root / JAVASCRIPT_TYPESCRIPT_SKILL_NAME / "SKILL.md"
         assert skill.is_file()
-        assert "name: dependency-risk-analysis" in skill.read_text(encoding="utf-8")
+        assert "name: javascript-typescript-dependency-risk-analysis" in skill.read_text(
+            encoding="utf-8"
+        )
 
     assert not skill_root.exists()
 
@@ -956,7 +1318,7 @@ def test_materialized_skill_root_copies_only_judge_skill(tmp_path: Path) -> None
         judge_skill = skill_root / JUDGE_SKILL_NAME / "SKILL.md"
         assert judge_skill.is_file()
         assert "name: dependency-risk-review" in judge_skill.read_text(encoding="utf-8")
-        assert not (skill_root / "dependency-risk-analysis").exists()
+        assert not (skill_root / JAVASCRIPT_TYPESCRIPT_SKILL_NAME).exists()
 
     assert not skill_root.exists()
 
@@ -976,7 +1338,7 @@ def test_materialized_skill_root_uses_extracted_resource(
         yield extracted
 
     def packaged_resource(relative: str) -> Traversable:
-        assert relative == "skills/dependency-risk-analysis"
+        assert relative == "skills/javascript-typescript-dependency-risk-analysis"
         return resource
 
     monkeypatch.setattr(assets_module, "package_resource", packaged_resource)
@@ -985,7 +1347,7 @@ def test_materialized_skill_root_uses_extracted_resource(
     destination = tmp_path / "state"
     destination.mkdir()
     with materialized_skill_root(destination) as skill_root:
-        assert (skill_root / "dependency-risk-analysis" / "SKILL.md").read_text(
+        assert (skill_root / JAVASCRIPT_TYPESCRIPT_SKILL_NAME / "SKILL.md").read_text(
             encoding="utf-8"
         ) == "extracted skill"
 
@@ -1012,7 +1374,7 @@ def test_asset_loader_rejects_unsupported_prompt_placeholders(
     monkeypatch.setattr(assets_module, "read_package_asset", read_asset)
 
     with pytest.raises(CopilotConfigurationError, match="exactly one"):
-        load_copilot_assets()
+        _investigator_assets()
 
 
 def test_asset_loader_rejects_missing_package_asset(
@@ -1024,7 +1386,7 @@ def test_asset_loader_rejects_missing_package_asset(
     monkeypatch.setattr(assets_module, "read_package_asset", missing_asset)
 
     with pytest.raises(CopilotConfigurationError, match="unable to load"):
-        load_copilot_assets()
+        _investigator_assets()
 
 
 def test_asset_loader_rejects_inferred_custom_agent(
@@ -1043,7 +1405,7 @@ def test_asset_loader_rejects_inferred_custom_agent(
     monkeypatch.setattr(assets_module, "read_package_asset", read_asset)
 
     with pytest.raises(CopilotConfigurationError, match="inference"):
-        load_copilot_assets()
+        _investigator_assets()
 
 
 def test_judge_asset_loader_rejects_tools(
@@ -1118,7 +1480,7 @@ def test_asset_loader_rejects_oversized_model_facing_metadata(
     monkeypatch.setattr(assets_module, "read_package_asset", read_asset)
 
     with pytest.raises(CopilotConfigurationError, match="character limit"):
-        load_copilot_assets()
+        _investigator_assets()
 
 
 def test_asset_loader_normalizes_crlf_assets(
@@ -1129,23 +1491,33 @@ def test_asset_loader_normalizes_crlf_assets(
     class CrLfResource:
         def read_text(self, *, encoding: str) -> str:
             assert encoding == "utf-8"
-            return original(SKILL_ASSET).read_text(encoding=encoding).replace("\n", "\r\n")
+            return (
+                original(JAVASCRIPT_TYPESCRIPT_SKILL_ASSET)
+                .read_text(encoding=encoding)
+                .replace("\n", "\r\n")
+            )
 
     def package_resource(relative_path: str) -> Traversable:
-        if relative_path == SKILL_ASSET:
+        if relative_path == JAVASCRIPT_TYPESCRIPT_SKILL_ASSET:
             return cast(Traversable, CrLfResource())
         return original(relative_path)
 
     monkeypatch.setattr(assets_module, "package_resource", package_resource)
 
-    assert load_copilot_assets().skill_name == "dependency-risk-analysis"
+    assert _investigator_assets().skill_name == "javascript-typescript-dependency-risk-analysis"
 
 
 def test_agent_asset_tracks_finding_schema_fields() -> None:
-    assets = load_copilot_assets()
+    assets = _investigator_assets()
 
     for field_name in AgentFinding.model_fields:
         assert field_name in assets.agent_prompt, f"missing finding field: {field_name}"
+
+
+def test_agent_finding_json_schema_requires_every_response_field() -> None:
+    schema = AgentFinding.model_json_schema()
+
+    assert set(schema["required"]) == set(AgentFinding.model_fields)
 
 
 def test_judge_agent_asset_tracks_review_schema_fields() -> None:
@@ -1168,7 +1540,7 @@ def test_session_asset_observer_is_identity_hashable_for_sdk_callbacks() -> None
     observer = SessionAssetObserver(
         expected_agent=AGENT_NAME,
         expected_tools=TOOL_NAMES,
-        expected_skill="dependency-risk-analysis",
+        expected_skill="javascript-typescript-dependency-risk-analysis",
     )
 
     assert observer in {observer}
@@ -1198,11 +1570,11 @@ def test_parse_model_output_rejects_missing_or_multiple_objects(content: str) ->
         parse_model_output(content)
 
 
-def test_session_asset_observer_accepts_lazy_skill_confirmation() -> None:
+def test_session_asset_observer_records_missing_inventory_as_diagnostic() -> None:
     observer = SessionAssetObserver(
         expected_agent=AGENT_NAME,
         expected_tools=TOOL_NAMES,
-        expected_skill="dependency-risk-analysis",
+        expected_skill="javascript-typescript-dependency-risk-analysis",
     )
     observer(
         cast(
@@ -1218,10 +1590,6 @@ def test_session_asset_observer_accepts_lazy_skill_confirmation() -> None:
         ),
     )
 
-    observer.validate_agent_selected()
-    with pytest.raises(CopilotConfigurationError, match="skill load was not confirmed"):
-        observer.validate_loaded()
-
     observer(
         cast(
             SessionEvent,
@@ -1230,7 +1598,7 @@ def test_session_asset_observer_accepts_lazy_skill_confirmation() -> None:
                 data=SessionSkillsLoadedData(
                     skills=[
                         SkillsLoadedSkill(
-                            name="dependency-risk-analysis",
+                            name="javascript-typescript-dependency-risk-analysis",
                             description="Dependency analysis.",
                             path="/tmp/skill",
                             enabled=True,
@@ -1253,14 +1621,17 @@ def test_session_asset_observer_accepts_lazy_skill_confirmation() -> None:
         ),
     )
 
-    observer.validate_loaded()
+    assert observer.finalize(None) == (
+        "agent_inventory_not_observed",
+        "response_agent_id_not_observed",
+    )
 
 
-def test_session_asset_observer_rejects_incomplete_disabled_skill_inventory() -> None:
+def test_session_asset_observer_ignores_disabled_skill_inventory() -> None:
     observer = SessionAssetObserver(
         expected_agent=AGENT_NAME,
         expected_tools=TOOL_NAMES,
-        expected_skill="dependency-risk-analysis",
+        expected_skill="javascript-typescript-dependency-risk-analysis",
     )
     observer(
         cast(
@@ -1283,7 +1654,7 @@ def test_session_asset_observer_rejects_incomplete_disabled_skill_inventory() ->
                 data=SessionSkillsLoadedData(
                     skills=[
                         SkillsLoadedSkill(
-                            name="dependency-risk-analysis",
+                            name="javascript-typescript-dependency-risk-analysis",
                             description="Dependency analysis.",
                             enabled=True,
                             source=SkillSource.CUSTOM,
@@ -1295,8 +1666,74 @@ def test_session_asset_observer_rejects_incomplete_disabled_skill_inventory() ->
         )
     )
 
-    with pytest.raises(CopilotConfigurationError, match="unexpected disabled skills"):
-        observer.validate_loaded()
+    assert observer.finalize(None) == (
+        "agent_inventory_not_observed",
+        "response_agent_id_not_observed",
+    )
+
+
+def test_session_asset_observer_diagnoses_missing_expected_skill() -> None:
+    observer = SessionAssetObserver(
+        expected_agent=AGENT_NAME,
+        expected_tools=TOOL_NAMES,
+        expected_skill="javascript-typescript-dependency-risk-analysis",
+    )
+    observer(
+        cast(
+            SessionEvent,
+            SimpleNamespace(
+                type=SessionEventType.SESSION_SKILLS_LOADED,
+                data=SessionSkillsLoadedData(
+                    skills=[
+                        SkillsLoadedSkill(
+                            name="javascript-typescript-dependency-risk-analysis",
+                            description="Dependency analysis.",
+                            enabled=False,
+                            source=SkillSource.CUSTOM,
+                            user_invocable=False,
+                        )
+                    ]
+                ),
+            ),
+        )
+    )
+
+    assert "expected_skill_not_observed" in observer.finalize(None)
+
+
+def test_session_asset_observer_rejects_conflicting_inventory_ids() -> None:
+    observer = SessionAssetObserver(
+        expected_agent=AGENT_NAME,
+        expected_tools=TOOL_NAMES,
+        expected_skill="javascript-typescript-dependency-risk-analysis",
+    )
+    for agent_id in ("first-agent", "second-agent"):
+        observer(
+            cast(
+                SessionEvent,
+                SimpleNamespace(
+                    type=SessionEventType.SESSION_CUSTOM_AGENTS_UPDATED,
+                    data=SessionCustomAgentsUpdatedData(
+                        agents=[
+                            CustomAgentsUpdatedAgent(
+                                description="description",
+                                display_name="Dependency Risk Investigator",
+                                id=agent_id,
+                                name=AGENT_NAME,
+                                source="custom",
+                                tools=list(TOOL_NAMES),
+                                user_invocable=True,
+                            )
+                        ],
+                        errors=[],
+                        warnings=[],
+                    ),
+                ),
+            )
+        )
+
+    with pytest.raises(CopilotConfigurationError, match="conflicting runtime agents"):
+        observer.finalize("second-agent")
 
 
 def test_environment_allowlist_excludes_tokens_and_unrelated_values() -> None:
@@ -1361,6 +1798,40 @@ async def test_schema_invalid_finding_uses_retry_budget(
     ]
 
 
+async def test_forbidden_ordinary_pair_uses_retry_budget(
+    fake_sdk: type[FakeClient],
+    tmp_path: Path,
+) -> None:
+    task = _task()
+    forbidden = json.loads(_finding(task))
+    finding = cast(dict[str, object], forbidden["finding"])
+    finding.update(
+        {
+            "uncertainty": "",
+            "proposed_recommendation": "deny",
+            "policy_reason_code": "decommission_not_valid",
+            "confidence": 0.9,
+            "insufficient_context": False,
+            "injection_detected": False,
+        }
+    )
+    fake_sdk.responses = iter((json.dumps(forbidden), _finding(task)))
+    turn = CopilotModelTurn("token")
+
+    result = await turn.run(
+        task,
+        _repository(tmp_path),
+        max_attempts=2,
+        wall_clock_seconds=10,
+    )
+
+    assert "finding" in result
+    assert [attempt.outcome for attempt in turn.attempts] == [
+        "malformed_output",
+        "success",
+    ]
+
+
 async def test_retry_uses_fresh_repository_tool_budget(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1381,6 +1852,7 @@ async def test_retry_uses_fresh_repository_tool_budget(
         attempt_tools.analyze_reachability(
             snapshot_id=assigned_task.snapshot_id,
             package_name=assigned_task.package_name,
+            profile="npm",
         )
         if len(attempt_tool_ids) == 1:
             attempt_tools.read_file("package.json")
@@ -1402,47 +1874,126 @@ async def test_retry_uses_fresh_repository_tool_budget(
 def test_registered_sdk_tool_names_match_exact_allowlist(tmp_path: Path) -> None:
     tools = repository_sdk_tools(
         _repository(tmp_path),
-        load_copilot_assets().tool_definitions,
+        _investigator_assets().tool_definitions,
         _task(),
     )
     assert [tool.name for tool in tools] == list(TOOL_NAMES)
     assert all(tool.overrides_built_in_tool for tool in tools)
 
+    python_root = tmp_path / "python"
+    python_root.mkdir()
+    python_tools = repository_sdk_tools(
+        _repository(python_root),
+        _investigator_assets("pip").tool_definitions,
+        _python_task(),
+    )
+    assert [tool.name for tool in python_tools] == list(TOOL_NAMES)
+    assert all(tool.overrides_built_in_tool for tool in python_tools)
+
+
+def test_task_reachability_rejects_evidence_profile_for_other_ecosystem(
+    tmp_path: Path,
+) -> None:
+    task = _task()
+    tools = _repository(tmp_path)
+    tools.reachability_invocation_count = 1
+    tools.reachability_evidence = ReachabilityEvidence(
+        snapshot_id=task.snapshot_id,
+        package_name=task.package_name,
+        target_identifiers=(task.package_name,),
+        profile="python",
+        engine="ast-grep",
+        engine_version="test",
+        status="no_syntax_match",
+        candidate_files=0,
+        staged_files=0,
+        skipped_files=0,
+        staged_bytes=0,
+        operations=PYTHON_REACHABILITY_OPERATIONS,
+        completed_operations=PYTHON_REACHABILITY_OPERATIONS,
+        limitations=("Synthetic result.",),
+    )
+
+    with pytest.raises(ValueError, match="does not match the assigned task"):
+        validate_task_reachability(task, tools)
+
 
 @pytest.mark.parametrize(
     ("configuration", "message"),
     (
-        ({"emit_selected_event": False}, "custom-agent selection was not confirmed"),
-        ({"emit_skill_event": False}, "skill load was not confirmed"),
         ({"deselect_agent": True}, "custom agent was deselected"),
-        ({"agent_source": "project"}, "wrong custom agent"),
-        ({"skill_source": SkillSource.PROJECT}, "untrusted skill"),
-        ({"skill_source": SkillSource.INHERITED}, "untrusted skill"),
-        ({"skill_source": SkillSource.PERSONAL_COPILOT}, "untrusted skill"),
-        ({"skill_source": SkillSource.PLUGIN}, "untrusted skill"),
-        ({"skill_source": SkillSource.BUILTIN}, "untrusted skill"),
-        ({"final_agent_id": None}, "wrong agent"),
+        ({"skill_source": SkillSource.PROJECT}, "untrusted enabled skill"),
+        ({"skill_source": SkillSource.INHERITED}, "untrusted enabled skill"),
+        ({"skill_source": SkillSource.PERSONAL_COPILOT}, "untrusted enabled skill"),
+        ({"skill_source": SkillSource.PLUGIN}, "untrusted enabled skill"),
+        ({"skill_source": SkillSource.BUILTIN}, "untrusted enabled skill"),
+        ({"reported_extra_tool": "shell"}, "outside the allowlist"),
     ),
 )
-async def test_real_boundary_rejects_unconfirmed_agent_or_skill_state(
+async def test_real_boundary_rejects_observed_capability_expansion(
     fake_sdk: type[FakeClient],
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     configuration: dict[str, object],
     message: str,
 ) -> None:
-    monkeypatch.setattr(copilot_module, "ASSET_LOAD_TIMEOUT_SECONDS", 0.01)
     fake_sdk.responses = iter((_finding(_task()),))
     for name, value in configuration.items():
         setattr(fake_sdk, name, value)
+    turn = CopilotModelTurn("token")
 
     with pytest.raises(CopilotConfigurationError, match=message):
-        await CopilotModelTurn("token").run(
+        await turn.run(
             _task(),
             _repository(tmp_path),
             max_attempts=1,
             wall_clock_seconds=10,
         )
+    assert turn.observed_model == "fake-model"
+    assert turn.diagnostics
+
+
+@pytest.mark.parametrize(
+    "configuration",
+    (
+        {"emit_agent_event": False},
+        {"emit_selected_event": False},
+        {"emit_skill_event": False},
+        {"agent_source": "project"},
+        {"reported_agent_name": "unexpected-agent"},
+        {"final_agent_id": None},
+    ),
+)
+async def test_real_boundary_accepts_missing_identity_diagnostics(
+    fake_sdk: type[FakeClient],
+    tmp_path: Path,
+    configuration: dict[str, object],
+) -> None:
+    fake_sdk.responses = iter((_finding(_task()),))
+    for name, value in configuration.items():
+        setattr(fake_sdk, name, value)
+    turn = CopilotModelTurn("token")
+
+    result = await turn.run(
+        _task(),
+        _repository(tmp_path),
+        max_attempts=1,
+        wall_clock_seconds=10,
+    )
+
+    assert "finding" in result
+    assert turn.diagnostics
+    permission_handler = cast(
+        Callable[[PermissionRequest, dict[str, str]], object],
+        fake_sdk.instances[0].session["on_permission_request"],
+    )
+    decision = cast(
+        SimpleNamespace,
+        permission_handler(
+            cast(PermissionRequest, object()),
+            {"session_id": "session"},
+        ),
+    )
+    assert decision.kind == "reject"
 
 
 async def test_real_boundary_accepts_selected_agent_without_inventory_identifier(
@@ -1477,7 +2028,7 @@ async def test_repository_skill_injection_fails_closed(
     fake_sdk.responses = iter((_finding(_task()),))
     fake_sdk.skill_source = SkillSource.PROJECT
 
-    with pytest.raises(CopilotConfigurationError, match="untrusted skill"):
+    with pytest.raises(CopilotConfigurationError, match="untrusted enabled skill"):
         await CopilotModelTurn("token").run(
             _task(),
             tools,

@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-09-08
 - **Amends:** ADR 0001's Copilot integration module ownership
-- **Amended by:** ADR 0012, ADR 0014, and ADR 0020
+- **Amended by:** ADR 0012, ADR 0014, ADR 0020, ADR 0026, and ADR 0027
 
 ## Context
 
@@ -23,6 +23,13 @@ The SDK Python cookbook also consistently separates session construction from
 the message sent with `send` or `send_and_wait`.
 
 ## Decision
+
+ADR 0027 supersedes the static investigator-skill binding and strict expected
+identity-event requirements below. The single investigator manifest declares
+no skill; trusted application code selects and materializes one ecosystem skill. Missing
+or mismatched expected identity inventory is diagnostic, while positively
+observed extra tools, unexpected enabled skills, deselection, or conflicting
+runtime identities still fail closed.
 
 - Keep `copilot.py` responsible for client/session lifecycle, attempts, model
   selection, event/result handling, and cleanup.
@@ -45,7 +52,7 @@ the message sent with `send` or `send_and_wait`.
   built-in skill discovery.
 - Keep task dispatch in a separate user prompt template. The rendered task must
   contain one fenced JSON block that round-trips to the assigned `AgentTask`.
-- Keep tool metadata declarative and executable handlers in Python. The custom
+- Keep tool metadata declarative and executable handlers in application code. The custom
   agent's tool list, declarative tool names, session `available_tools`, and
   constructed SDK tools must be identical.
 - Continue using `CopilotClient(mode="empty")`, explicit permission denial,

@@ -1,9 +1,9 @@
-# ADR 0003: Separate deterministic and agentic reasoning
+# ADR 0003: Separate deterministic and model-assisted reasoning
 
 - **Status:** Accepted
 - **Date:** 2026-09-02
 - **Supersedes:** ADR 0002's tool-less analyst
-- **Amended by:** ADR 0005, ADR 0007, and ADR 0019
+- **Amended by:** ADR 0005, ADR 0007, ADR 0019, and ADR 0021
 
 ## Context
 

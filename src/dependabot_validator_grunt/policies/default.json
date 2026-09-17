@@ -1,6 +1,6 @@
 {
-  "policy_id": "default-npm-dismissal",
-  "version": "2.0.0",
+  "policy_id": "default-dependency-review",
+  "version": "3.0.0",
   "routes": {
     "fix_started": {"mode": "deterministic", "permitted_final": ["deny", "human_review"]},
     "no_bandwidth": {"mode": "deterministic", "permitted_final": ["deny", "human_review"]},
@@ -29,9 +29,11 @@
     "max_results": 200,
     "max_session_bytes": 33554432,
     "max_proof_scan_bytes": 67108864,
-    "analyzer_wall_seconds": 60,
-    "max_analyzer_files": 10000,
-    "max_analyzer_input_bytes": 67108864,
+    "analyzer_wall_seconds": 120,
+    "max_analyzer_files": 20000,
+    "max_analyzer_input_bytes": 134217728,
+    "max_analyzer_batch_files": 1000,
+    "max_analyzer_batch_bytes": 16777216,
     "max_analyzer_output_bytes": 4194304,
     "max_analyzer_stderr_bytes": 262144,
     "max_analyzer_findings": 500

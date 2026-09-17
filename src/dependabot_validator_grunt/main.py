@@ -14,6 +14,10 @@ import typer
 from dotenv import dotenv_values
 
 from dependabot_validator_grunt import __version__
+from dependabot_validator_grunt.agent_evaluation import (
+    EvaluationError,
+    evaluate_agent_capabilities,
+)
 from dependabot_validator_grunt.copilot import (
     CopilotConfigurationError,
     CopilotFindingJudge,
@@ -98,7 +102,7 @@ def _copilot_turn(
         return None
     return JudgedModelTurn(
         CopilotModelTurn(token, model=model),
-        CopilotFindingJudge(token, model=model),
+        lambda: CopilotFindingJudge(token, model=model),
     )
 
 
@@ -130,6 +134,20 @@ def _run_workflow(workflow: Callable[[], Coroutine[object, object, Path]]) -> No
         typer.echo(f"{error.stage}: {error}", err=True)
         raise typer.Exit(error.exit_code) from error
     typer.echo(artifact_directory)
+
+
+def _run_evaluation(workflow: Callable[[], Coroutine[object, object, Path]]) -> None:
+    try:
+        summary_path = asyncio.run(workflow())
+    except asyncio.CancelledError as error:
+        typer.echo("agentic: Copilot operation cancelled", err=True)
+        raise typer.Exit(6) from error
+    except EvaluationError as error:
+        if error.summary_path is not None:
+            typer.echo(error.summary_path)
+        typer.echo(f"evaluation: {error}", err=True)
+        raise typer.Exit(9) from error
+    typer.echo(summary_path)
 
 
 def create_app(version: str) -> typer.Typer:
@@ -274,6 +292,30 @@ def create_app(version: str) -> typer.Typer:
         )
 
     app.command("triage-alert")(triage_alert)
+
+    def evaluate_capabilities(
+        manifest: Annotated[
+            Path,
+            typer.Option("--manifest", exists=True, dir_okay=False, readable=True),
+        ],
+        output: Annotated[Path, typer.Option("--output")] = Path("agent-evaluations"),
+        policy: Annotated[
+            Path | None, typer.Option("--policy", exists=True, dir_okay=False)
+        ] = None,
+        model: Annotated[str | None, typer.Option("--model")] = None,
+    ) -> None:
+        """Evaluate the current investigator against offline fixtures."""
+        _run_evaluation(
+            lambda: evaluate_agent_capabilities(
+                manifest,
+                output,
+                model=model,
+                copilot_token=os.environ.get("COPILOT_GITHUB_TOKEN"),
+                policy_path=policy,
+            )
+        )
+
+    app.command("evaluate-agent-capabilities")(evaluate_capabilities)
     return app
 
 

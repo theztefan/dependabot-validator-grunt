@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable
 from typing import Protocol
 
 from pydantic import TypeAdapter
 
 from dependabot_validator_grunt.agentic import RepositoryTools, validate_finding
+from dependabot_validator_grunt.copilot_tools import validate_task_reachability
 from dependabot_validator_grunt.models import (
     AgentFinding,
     AgentTask,
@@ -22,8 +24,11 @@ MAX_JUDGE_PAYLOAD_CHARACTERS = 12_000
 MAX_JUDGE_OUTPUT_CHARACTERS = 8_000
 MAX_JUDGE_SECONDS = 60
 MAX_JUDGE_CITATIONS = 8
-MAX_JUDGE_INSTANCES = 20
-MAX_JUDGE_DECLARATIONS = 12
+MAX_JUDGE_INSTANCES = 10
+MAX_JUDGE_CONSUMERS = 10
+MAX_JUDGE_PATHS = 4
+MAX_JUDGE_DECLARATIONS = 8
+MAX_JUDGE_PROVENANCE = 8
 JUDGE_PLACEHOLDER = "{{judge_json}}"
 
 
@@ -75,36 +80,61 @@ def judge_payload(
             "dismissal_reason": task.dismissal_reason,
             "justification": task.justification[:1200],
             "advisory_summary": task.advisory_summary[:1200],
+            "ecosystem": task.ecosystem,
             "package_name": task.package_name,
+            "package_identity": task.package_identity,
             "vulnerable_range": task.vulnerable_range,
             "manifest_path": task.manifest_path,
             "dependency_scope": task.dependency_scope,
+            "dependency_relationship": task.dependency_relationship,
             "installed_instance_count": task.installed_instance_count,
-            "installed_instances": [
-                value[:240] for value in task.installed_instances[:MAX_JUDGE_INSTANCES]
-            ],
             "installed_instance_details": [
                 instance.model_dump(mode="json")
                 for instance in task.installed_instance_details[:MAX_JUDGE_INSTANCES]
             ],
             "installed_instance_details_truncated": (
-                len(task.installed_instance_details) > MAX_JUDGE_INSTANCES
+                task.installed_instance_details_truncated
+                or len(task.installed_instance_details) > MAX_JUDGE_INSTANCES
             ),
             "dependency_package_manager": task.dependency_package_manager,
+            "dependency_version_scheme": task.dependency_version_scheme,
             "dependency_lockfile_version": task.dependency_lockfile_version,
-            "npm_completeness": task.npm_completeness,
+            "dependency_completeness": task.dependency_completeness,
             "dependency_evidence_capabilities": list(task.dependency_evidence_capabilities),
-            "dependency_consumer_count": len(task.dependency_consumers),
+            "dependency_consumer_count": task.dependency_consumer_count,
             "dependency_consumers": [
-                value[:240] for value in task.dependency_consumers[:MAX_JUDGE_INSTANCES]
+                value[:240] for value in task.dependency_consumers[:MAX_JUDGE_CONSUMERS]
             ],
             "dependency_consumers_truncated": (
-                len(task.dependency_consumers) > MAX_JUDGE_INSTANCES
+                task.dependency_consumers_truncated
+                or len(task.dependency_consumers) > MAX_JUDGE_CONSUMERS
             ),
+            "dependency_path_count": task.dependency_path_count,
+            "dependency_paths": [
+                path.model_dump(mode="json") for path in task.dependency_paths[:MAX_JUDGE_PATHS]
+            ],
+            "dependency_paths_truncated": (
+                task.dependency_paths_truncated or len(task.dependency_paths) > MAX_JUDGE_PATHS
+            ),
+            "import_targets": [target.model_dump(mode="json") for target in task.import_targets],
+            "manifest_declaration_count": task.manifest_declaration_count,
             "manifest_declarations": [
                 declaration.model_dump(mode="json")
                 for declaration in task.manifest_declarations[:MAX_JUDGE_DECLARATIONS]
             ],
+            "manifest_declarations_truncated": (
+                task.manifest_declarations_truncated
+                or len(task.manifest_declarations) > MAX_JUDGE_DECLARATIONS
+            ),
+            "dependency_provenance_count": task.dependency_provenance_count,
+            "dependency_provenance": [
+                provenance.model_dump(mode="json")
+                for provenance in task.dependency_provenance[:MAX_JUDGE_PROVENANCE]
+            ],
+            "dependency_provenance_truncated": (
+                task.dependency_provenance_truncated
+                or len(task.dependency_provenance) > MAX_JUDGE_PROVENANCE
+            ),
             "repository_file_count": task.repository_file_count,
             "permitted_proposals": [
                 permission.model_dump(mode="json") for permission in task.permitted_proposals
@@ -121,8 +151,12 @@ def judge_payload(
                 "status": reachability.status,
                 "engine": reachability.engine,
                 "engine_version": reachability.engine_version,
-                "scanned_files": reachability.scanned_files,
-                "scanned_bytes": reachability.scanned_bytes,
+                "target_identifiers": list(reachability.target_identifiers),
+                "candidate_files": reachability.candidate_files,
+                "staged_files": reachability.staged_files,
+                "skipped_files": reachability.skipped_files,
+                "staged_bytes": reachability.staged_bytes,
+                "completed_operations": list(reachability.completed_operations),
                 "finding_count": len(reachability.findings),
                 "limitations": list(reachability.limitations[:4]),
             }
@@ -139,22 +173,36 @@ def judge_payload(
         task_payload = TypeAdapter(dict[str, object]).validate_python(payload["task"])
         task_payload["justification"] = task.justification[:400]
         task_payload["advisory_summary"] = task.advisory_summary[:400]
-        task_payload["installed_instances"] = [
-            value[:160] for value in task.installed_instances[:5]
-        ]
         task_payload["installed_instance_details"] = [
             instance.model_dump(mode="json") for instance in task.installed_instance_details[:5]
         ]
         task_payload["installed_instance_details_truncated"] = (
-            len(task.installed_instance_details) > 5
+            task.installed_instance_details_truncated or len(task.installed_instance_details) > 5
         )
         task_payload["dependency_consumers"] = [
             value[:160] for value in task.dependency_consumers[:5]
         ]
-        task_payload["dependency_consumers_truncated"] = len(task.dependency_consumers) > 5
+        task_payload["dependency_consumers_truncated"] = (
+            task.dependency_consumers_truncated or len(task.dependency_consumers) > 5
+        )
+        task_payload["dependency_paths"] = [
+            path.model_dump(mode="json") for path in task.dependency_paths[:2]
+        ]
+        task_payload["dependency_paths_truncated"] = (
+            task.dependency_paths_truncated or len(task.dependency_paths) > 2
+        )
         task_payload["manifest_declarations"] = [
             declaration.model_dump(mode="json") for declaration in task.manifest_declarations[:5]
         ]
+        task_payload["manifest_declarations_truncated"] = (
+            task.manifest_declarations_truncated or len(task.manifest_declarations) > 5
+        )
+        task_payload["dependency_provenance"] = [
+            provenance.model_dump(mode="json") for provenance in task.dependency_provenance[:5]
+        ]
+        task_payload["dependency_provenance_truncated"] = (
+            task.dependency_provenance_truncated or len(task.dependency_provenance) > 5
+        )
         finding_payload = TypeAdapter(dict[str, object]).validate_python(payload["primary_finding"])
         finding_payload["citations"] = [
             citation.model_dump(mode="json") for citation in finding.citations[:4]
@@ -220,7 +268,10 @@ def validate_judge_review(
     replacement = review.replacement_finding
     if replacement is None:
         raise ValueError("judge replacement finding is missing")
-    selected = validate_finding(replacement.model_dump(mode="json"), task, tools)
+    if primary_finding.insufficient_context and not replacement.insufficient_context:
+        raise ValueError("judge replacement cannot clear insufficient context")
+    if primary_finding.injection_detected and not replacement.injection_detected:
+        raise ValueError("judge replacement cannot clear injection detection")
     payload = judge_payload(task, primary_finding, tools)
     finding_payload = TypeAdapter(dict[str, object]).validate_python(payload["primary_finding"])
     exposed_citations = TypeAdapter(list[dict[str, object]]).validate_python(
@@ -229,19 +280,46 @@ def validate_judge_review(
     allowed_citations = {canonical_json(citation) for citation in exposed_citations}
     if any(
         canonical_json(citation.model_dump(mode="json")) not in allowed_citations
-        for citation in selected.citations
+        for citation in replacement.citations
     ):
         raise ValueError("judge replacement cites evidence outside its frozen context")
+    selected = validate_finding(replacement.model_dump(mode="json"), task, tools)
     return selected
 
 
 class JudgedModelTurn:
     """Compose a primary model turn with one non-blocking judge forum."""
 
-    def __init__(self, primary: PrimaryModelTurn, judge: FindingJudge) -> None:
+    def __init__(
+        self,
+        primary: PrimaryModelTurn,
+        judge_provider: Callable[[], FindingJudge],
+    ) -> None:
         self.primary = primary
-        self.judge = judge
-        self.identity = getattr(primary, "identity", "copilot:not_run")
+        self.judge_provider = judge_provider
+        self.execution_mode = getattr(primary, "execution_mode", "scripted")
+        self.requested_model = getattr(primary, "requested_model", None)
+
+    @property
+    def identity(self) -> str:
+        """Expose the primary runtime identity."""
+        return str(getattr(self.primary, "identity", "copilot:not_run"))
+
+    @property
+    def observed_model(self) -> str | None:
+        """Expose the model positively observed by the primary runtime."""
+        value = getattr(self.primary, "observed_model", None)
+        return value if isinstance(value, str) else None
+
+    @property
+    def attempts(self) -> tuple[object, ...]:
+        """Expose primary-attempt provenance without coupling to its class."""
+        return tuple(getattr(self.primary, "attempts", ()))
+
+    @property
+    def diagnostics(self) -> tuple[str, ...]:
+        """Expose primary runtime diagnostics."""
+        return tuple(getattr(self.primary, "diagnostics", ()))
 
     async def run(
         self,
@@ -258,9 +336,9 @@ class JudgedModelTurn:
             max_attempts=max_attempts,
             wall_clock_seconds=wall_clock_seconds,
         )
-        self.identity = self.primary.identity
         raw_finding = TypeAdapter(dict[str, object]).validate_python(raw.get("finding"))
         primary_finding = validate_finding(raw_finding, task, tools)
+        validate_task_reachability(task, tools)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             failure = JudgeFailure(
@@ -273,7 +351,19 @@ class JudgedModelTurn:
                 "judge_review": failure.model_dump(mode="json"),
             }
         try:
-            review = await self.judge.review(
+            judge = self.judge_provider()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failure = JudgeFailure(
+                    reason="timeout",
+                    message="Judge forum skipped because construction exhausted the deadline.",
+                )
+                return {
+                    **raw,
+                    "primary_finding": primary_finding.model_dump(mode="json"),
+                    "judge_review": failure.model_dump(mode="json"),
+                }
+            review = await judge.review(
                 task=task,
                 finding=primary_finding,
                 tools=tools,

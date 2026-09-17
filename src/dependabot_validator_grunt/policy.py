@@ -64,9 +64,11 @@ class Limits(BaseModel):
     max_results: int = Field(default=200, ge=1)
     max_session_bytes: int = Field(default=32 * 1024 * 1024, ge=1)
     max_proof_scan_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
-    analyzer_wall_seconds: int = Field(default=60, ge=1, le=600)
-    max_analyzer_files: int = Field(default=10_000, ge=1)
-    max_analyzer_input_bytes: int = Field(default=64 * 1024 * 1024, ge=1)
+    analyzer_wall_seconds: int = Field(default=120, ge=1, le=600)
+    max_analyzer_files: int = Field(default=20_000, ge=1)
+    max_analyzer_input_bytes: int = Field(default=128 * 1024 * 1024, ge=1)
+    max_analyzer_batch_files: int = Field(default=1_000, ge=1)
+    max_analyzer_batch_bytes: int = Field(default=16 * 1024 * 1024, ge=1)
     max_analyzer_output_bytes: int = Field(default=4 * 1024 * 1024, ge=1)
     max_analyzer_stderr_bytes: int = Field(default=256 * 1024, ge=1)
     max_analyzer_findings: int = Field(default=500, ge=1)
@@ -79,6 +81,10 @@ class Limits(BaseModel):
             raise ValueError("dependency-file limit cannot exceed expanded archive limit")
         if self.max_read_bytes > self.max_session_bytes:
             raise ValueError("single agent read cannot exceed the session byte limit")
+        if self.max_analyzer_batch_files > self.max_analyzer_files:
+            raise ValueError("analyzer batch files cannot exceed aggregate analyzer files")
+        if self.max_analyzer_batch_bytes > self.max_analyzer_input_bytes:
+            raise ValueError("analyzer batch bytes cannot exceed aggregate analyzer input")
         return self
 
 
@@ -117,6 +123,11 @@ class Policy(BaseModel):
             )
             if "human_review" not in route.permitted_final:
                 raise ValueError(f"route {reason!r} must permit fail-closed human review")
+            if (
+                route.mode == "deterministic_then_agentic"
+                and "human_review" not in route.agent_permitted
+            ):
+                raise ValueError(f"agentic route {reason!r} must permit fail-closed human review")
             if reason == "tolerable_risk" and "approve" in route.permitted_final:
                 raise ValueError("tolerable_risk cannot permit approval without structured proof")
             if not set(route.agent_permitted) <= set(route.permitted_final):

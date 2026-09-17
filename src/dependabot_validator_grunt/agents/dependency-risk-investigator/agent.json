@@ -1,7 +1,7 @@
 {
   "name": "dependency-risk-investigator",
   "display_name": "Dependency Risk Investigator",
-  "description": "Read-only analysis of Dependabot dismissal and triage evidence.",
+  "description": "Read-only ecosystem-selected analysis of Dependabot evidence.",
   "prompt_asset": "agents/dependency-risk-investigator/prompt.md",
   "tools": [
     "list_files",
@@ -9,8 +9,6 @@
     "search",
     "analyze_reachability"
   ],
-  "skills": [
-    "dependency-risk-analysis"
-  ],
+  "skills": [],
   "infer": false
 }

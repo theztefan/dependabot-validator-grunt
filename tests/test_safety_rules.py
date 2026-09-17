@@ -130,22 +130,40 @@ def test_sdk_calls_require_empty_mode_tools_and_permissions() -> None:
                 if missing:
                     violations.append(f"{location}: {name} missing {', '.join(sorted(missing))}")
                 if available_tools is not None:
+                    conditional_tool_sets = None
+                    if isinstance(available_tools, ast.IfExp):
+                        true_tools = string_sequence(available_tools.body, constants)
+                        false_tools = string_sequence(available_tools.orelse, constants)
+                        if true_tools is not None and false_tools is not None:
+                            conditional_tool_sets = {true_tools, false_tools}
                     uses_tool_names = (
                         isinstance(available_tools, ast.Call)
                         and isinstance(available_tools.func, ast.Name)
                         and available_tools.func.id == "list"
                         and len(available_tools.args) == 1
                         and isinstance(available_tools.args[0], ast.Name)
-                        and available_tools.args[0].id == "TOOL_NAMES"
+                        and available_tools.args[0].id in {"TOOL_NAMES", "tool_names"}
                     )
-                    if resolved_tools is None and not uses_tool_names:
+                    approved_sets = {
+                        ("list_files", "read_file", "search"),
+                        ("list_files", "read_file", "search", "analyze_reachability"),
+                    }
+                    if (
+                        resolved_tools is None
+                        and not uses_tool_names
+                        and conditional_tool_sets is None
+                    ):
                         violations.append(
                             f"{location}: {name} available_tools is not statically resolvable"
                         )
-                    elif resolved_tools is not None and resolved_tools not in {
-                        (),
-                        ("list_files", "read_file", "search"),
-                    }:
+                    elif (
+                        resolved_tools is not None
+                        and resolved_tools != ()
+                        and resolved_tools not in approved_sets
+                    ) or (
+                        conditional_tool_sets is not None
+                        and not conditional_tool_sets <= approved_sets
+                    ):
                         violations.append(
                             f"{location}: {name} available_tools is not an approved exact set"
                         )

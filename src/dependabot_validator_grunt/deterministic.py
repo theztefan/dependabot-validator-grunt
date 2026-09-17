@@ -2,20 +2,31 @@
 
 from __future__ import annotations
 
+from pathlib import PurePosixPath
 from typing import Literal
 
+from dependabot_validator_grunt.dependency import version_is_vulnerable
 from dependabot_validator_grunt.models import (
+    AGENT_TASK_DECLARATION_SAMPLE_LIMIT,
+    AGENT_TASK_DEPENDENCY_CONSUMER_SAMPLE_LIMIT,
+    AGENT_TASK_DEPENDENCY_PATH_SAMPLE_LIMIT,
+    AGENT_TASK_INSTALLED_INSTANCE_SAMPLE_LIMIT,
+    AGENT_TASK_PROVENANCE_SAMPLE_LIMIT,
     AgentFinding,
     AgentProposalPermission,
     AgentTask,
     DeterministicProof,
     DismissalDecision,
     EvidenceBundle,
+    ImportTarget,
+    ReachabilityEvidence,
     RepositoryReferenceEvidence,
     TriageDecision,
+    analysis_family,
+    normalize_package_identifier,
 )
-from dependabot_validator_grunt.npm import version_is_vulnerable
 from dependabot_validator_grunt.policy import AGENT_APPROVAL_CODES_BY_REASON, Policy
+from dependabot_validator_grunt.python_imports import python_import_targets
 
 DENIAL_REASON_CODES = (
     "advisory_applies",
@@ -23,6 +34,7 @@ DENIAL_REASON_CODES = (
     "reason_justification_mismatch",
 )
 TRIAGE_DENIAL_REASON_CODES = ("advisory_applies",)
+PYTHON_DENIAL_REASON_CODES = ("advisory_applies",)
 HUMAN_REVIEW_REASON_CODES = ("insufficient_context", "injection_detected")
 FIRST_PARTY_RELATIONSHIPS = {"direct", "development", "optional", "workspace"}
 ANALYSIS_REASONS = {"tolerable_risk", "not_used", "inaccurate"}
@@ -30,6 +42,13 @@ PUBLIC_APPROVAL_REASON_CODES = {
     "approve_package_absent": "dependency_no_longer_present",
     "approve_unaffected_versions": "version_not_affected",
 }
+
+
+def _bounded_sample[ValueT](
+    values: tuple[ValueT, ...],
+    limit: int,
+) -> tuple[tuple[ValueT, ...], bool]:
+    return values[:limit], len(values) > limit
 
 
 def _task_context(
@@ -42,9 +61,31 @@ def _task_context(
     approval_codes: tuple[str, ...],
     denial_codes: tuple[str, ...],
 ) -> AgentTask:
-    installed = tuple(
-        f"{instance.path}:{instance.version or 'unknown'}:{instance.relationship}"
-        for instance in bundle.npm.instances[:100]
+    if analysis_family(bundle.alert.ecosystem) == "python":
+        permitted_outcomes = tuple(
+            outcome for outcome in permitted_outcomes if outcome != "approve"
+        )
+        approval_codes = ()
+        denial_codes = PYTHON_DENIAL_REASON_CODES
+    installed_instance_details, installed_instance_details_truncated = _bounded_sample(
+        bundle.dependency.instances,
+        AGENT_TASK_INSTALLED_INSTANCE_SAMPLE_LIMIT,
+    )
+    dependency_consumers, dependency_consumers_truncated = _bounded_sample(
+        bundle.dependency.dependency_consumers,
+        AGENT_TASK_DEPENDENCY_CONSUMER_SAMPLE_LIMIT,
+    )
+    dependency_paths, task_dependency_paths_truncated = _bounded_sample(
+        bundle.dependency.dependency_paths,
+        AGENT_TASK_DEPENDENCY_PATH_SAMPLE_LIMIT,
+    )
+    manifest_declarations, manifest_declarations_truncated = _bounded_sample(
+        bundle.dependency.declarations,
+        AGENT_TASK_DECLARATION_SAMPLE_LIMIT,
+    )
+    dependency_provenance, dependency_provenance_truncated = _bounded_sample(
+        bundle.dependency.dependency_provenance,
+        AGENT_TASK_PROVENANCE_SAMPLE_LIMIT,
     )
     reason_codes = {
         "approve": approval_codes,
@@ -59,6 +100,11 @@ def _task_context(
         for outcome in permitted_outcomes
         if reason_codes[outcome]
     )
+    import_targets: tuple[ImportTarget, ...] = ()
+    if analysis_family(bundle.alert.ecosystem) == "python":
+        import_targets = python_import_targets(bundle.alert.package_identity)
+    manifest = PurePosixPath(bundle.alert.manifest_path)
+    analysis_root = "" if manifest.parent == PurePosixPath(".") else manifest.parent.as_posix()
     return AgentTask(
         workflow_mode=bundle.workflow_mode,
         correlation_id=bundle.correlation_id,
@@ -70,34 +116,56 @@ def _task_context(
         dismissal_reason=dismissal_reason,
         justification=justification[:4000],
         advisory_summary=bundle.alert.summary[:4000],
+        ecosystem=bundle.alert.ecosystem,
         package_name=bundle.alert.package_name,
+        package_identity=bundle.alert.package_identity,
         vulnerable_range=bundle.alert.vulnerable_range,
         manifest_path=bundle.alert.manifest_path,
+        analysis_root=analysis_root,
         dependency_scope=bundle.alert.scope,
-        installed_instances=installed,
-        installed_instance_count=len(bundle.npm.instances),
-        installed_instance_details=bundle.npm.instances,
-        dependency_package_manager=bundle.npm.package_manager,
-        dependency_lockfile_version=bundle.npm.lockfile_version,
-        npm_completeness=bundle.npm.completeness,
-        dependency_evidence_capabilities=bundle.npm.proof_capabilities,
-        dependency_consumers=bundle.npm.dependency_consumers,
-        manifest_declarations=bundle.npm.declarations,
+        dependency_relationship=bundle.alert.dependency_relationship,
+        installed_instance_count=len(bundle.dependency.instances),
+        installed_instance_details=installed_instance_details,
+        installed_instance_details_truncated=installed_instance_details_truncated,
+        dependency_package_manager=bundle.dependency.package_manager,
+        dependency_version_scheme=bundle.dependency.version_scheme,
+        dependency_lockfile_version=bundle.dependency.lockfile_version,
+        dependency_completeness=bundle.dependency.completeness,
+        dependency_evidence_capabilities=bundle.dependency.proof_capabilities,
+        dependency_consumer_count=len(bundle.dependency.dependency_consumers),
+        dependency_consumers=dependency_consumers,
+        dependency_consumers_truncated=dependency_consumers_truncated,
+        dependency_path_count=len(bundle.dependency.dependency_paths),
+        dependency_paths=dependency_paths,
+        dependency_paths_truncated=(
+            bundle.dependency.dependency_paths_truncated or task_dependency_paths_truncated
+        ),
+        import_targets=import_targets,
+        manifest_declaration_count=len(bundle.dependency.declarations),
+        manifest_declarations=manifest_declarations,
+        manifest_declarations_truncated=manifest_declarations_truncated,
+        dependency_provenance_count=len(bundle.dependency.dependency_provenance),
+        dependency_provenance=dependency_provenance,
+        dependency_provenance_truncated=dependency_provenance_truncated,
         repository_file_count=len(bundle.repository.included_paths),
         permitted_proposals=permitted_proposals,
     )
 
 
 def _all_instances_unaffected(bundle: EvidenceBundle) -> bool:
-    """Return whether complete npm evidence proves every instance unaffected."""
-    if not bundle.npm.instances:
+    """Return whether every comparable dependency record is unaffected."""
+    if not bundle.dependency.instances:
         return False
     try:
         return all(
             instance.version is not None
             and instance.comparable
-            and not version_is_vulnerable(instance.version, bundle.alert.vulnerable_range)
-            for instance in bundle.npm.instances
+            and not version_is_vulnerable(
+                bundle.alert.ecosystem,
+                instance.version,
+                bundle.alert.vulnerable_range,
+            )
+            for instance in bundle.dependency.instances
         )
     except ValueError:
         return False
@@ -110,27 +178,27 @@ def _tolerable_risk_context_proofs(
     if (
         bundle.request is None
         or bundle.request.reason != "tolerable_risk"
-        or bundle.npm.completeness != "complete"
+        or "complete_inventory" not in bundle.dependency.proof_capabilities
     ):
         return ()
-    if not bundle.npm.instances and "approve_package_absent" in policy.enabled_rules:
+    if not bundle.dependency.instances and "approve_package_absent" in policy.enabled_rules:
         return (
             DeterministicProof(
                 rule_id="approve_package_absent",
-                summary="The alerted package has no installed instances.",
-                evidence_ids=("npm.instances",),
+                summary="The alerted package has no recorded dependency instances.",
+                evidence_ids=("dependency.instances",),
             ),
         )
     if (
-        bundle.npm.instances
+        bundle.dependency.instances
         and _all_instances_unaffected(bundle)
         and "approve_unaffected_versions" in policy.enabled_rules
     ):
         return (
             DeterministicProof(
                 rule_id="approve_unaffected_versions",
-                summary="Every installed instance is outside the vulnerable range.",
-                evidence_ids=("npm.instances", "alert.vulnerable_range"),
+                summary="Every recorded dependency instance is outside the vulnerable range.",
+                evidence_ids=("dependency.instances", "alert.vulnerable_range"),
             ),
         )
     return ()
@@ -171,13 +239,14 @@ def decide(bundle: EvidenceBundle, policy: Policy) -> DismissalDecision | AgentT
                 ),
             ),
         )
-    npm = bundle.npm
-    if reason in ANALYSIS_REASONS and npm.completeness == "complete":
-        if not npm.instances and "approve_package_absent" in policy.enabled_rules:
+    dependency = bundle.dependency
+    complete_inventory = "complete_inventory" in dependency.proof_capabilities
+    if reason in ANALYSIS_REASONS and complete_inventory:
+        if not dependency.instances and "approve_package_absent" in policy.enabled_rules:
             proof = DeterministicProof(
                 rule_id="approve_package_absent",
-                summary="The alerted package has no installed instances.",
-                evidence_ids=("npm.instances",),
+                summary="The alerted package has no recorded dependency instances.",
+                evidence_ids=("dependency.instances",),
             )
             if reason != "tolerable_risk" and "approve" not in route.permitted_final:
                 return DismissalDecision(
@@ -194,14 +263,14 @@ def decide(bundle: EvidenceBundle, policy: Policy) -> DismissalDecision | AgentT
                 )
         all_unaffected = _all_instances_unaffected(bundle)
         if (
-            npm.instances
+            dependency.instances
             and all_unaffected
             and "approve_unaffected_versions" in policy.enabled_rules
         ):
             proof = DeterministicProof(
                 rule_id="approve_unaffected_versions",
-                summary="Every installed instance is outside the vulnerable range.",
-                evidence_ids=("npm.instances", "alert.vulnerable_range"),
+                summary="Every recorded dependency instance is outside the vulnerable range.",
+                evidence_ids=("dependency.instances", "alert.vulnerable_range"),
             )
             if reason != "tolerable_risk" and "approve" not in route.permitted_final:
                 return DismissalDecision(
@@ -247,11 +316,15 @@ def decide_triage(bundle: EvidenceBundle, policy: Policy) -> TriageDecision:
     priority = bundle.alert.severity
     vulnerable_paths: list[str] = []
     range_error = False
-    for instance in bundle.npm.instances:
+    for instance in bundle.dependency.instances:
         if not instance.comparable or instance.version is None:
             continue
         try:
-            if version_is_vulnerable(instance.version, bundle.alert.vulnerable_range):
+            if version_is_vulnerable(
+                bundle.alert.ecosystem,
+                instance.version,
+                bundle.alert.vulnerable_range,
+            ):
                 vulnerable_paths.append(instance.path)
         except ValueError:
             range_error = True
@@ -259,13 +332,13 @@ def decide_triage(bundle: EvidenceBundle, policy: Policy) -> TriageDecision:
     if (
         vulnerable_paths
         and not range_error
-        and "resolved_instances" in bundle.npm.proof_capabilities
+        and "resolved_instances" in bundle.dependency.proof_capabilities
         and "triage_vulnerable_applies" in policy.enabled_rules
     ):
         proof = DeterministicProof(
             rule_id="triage_vulnerable_applies",
-            summary="At least one installed instance is in the vulnerable range.",
-            evidence_ids=("npm.instances", "alert.vulnerable_range"),
+            summary="At least one recorded dependency instance is in the vulnerable range.",
+            evidence_ids=("dependency.instances", "alert.vulnerable_range"),
         )
         return TriageDecision(
             priority=priority,
@@ -282,13 +355,13 @@ def decide_triage(bundle: EvidenceBundle, policy: Policy) -> TriageDecision:
             reason_code="triage_unparseable_range",
             missing_evidence=("parseable vulnerable range",),
         )
-    if bundle.npm.completeness != "complete":
+    if "complete_inventory" not in bundle.dependency.proof_capabilities:
         return TriageDecision(
             priority=priority,
             assessment="human_review",
             recommended_action="investigate",
             reason_code="triage_incomplete_evidence",
-            missing_evidence=tuple(bundle.npm.issues) or ("complete npm evidence",),
+            missing_evidence=tuple(bundle.dependency.issues) or ("complete dependency evidence",),
         )
     if vulnerable_paths:
         return TriageDecision(
@@ -298,11 +371,11 @@ def decide_triage(bundle: EvidenceBundle, policy: Policy) -> TriageDecision:
             reason_code="triage_rule_disabled",
             missing_evidence=("enabled triage_vulnerable_applies rule",),
         )
-    if not bundle.npm.instances and "triage_absent_does_not_apply" in policy.enabled_rules:
+    if not bundle.dependency.instances and "triage_absent_does_not_apply" in policy.enabled_rules:
         proof = DeterministicProof(
             rule_id="triage_absent_does_not_apply",
-            summary="The alerted package has no installed instances.",
-            evidence_ids=("npm.instances",),
+            summary="The alerted package has no recorded dependency instances.",
+            evidence_ids=("dependency.instances",),
         )
         return TriageDecision(
             priority=priority,
@@ -312,14 +385,14 @@ def decide_triage(bundle: EvidenceBundle, policy: Policy) -> TriageDecision:
             proofs=(proof,),
         )
     if (
-        bundle.npm.instances
+        bundle.dependency.instances
         and _all_instances_unaffected(bundle)
         and "triage_unaffected_does_not_apply" in policy.enabled_rules
     ):
         proof = DeterministicProof(
             rule_id="triage_unaffected_does_not_apply",
-            summary="Every installed instance is outside the vulnerable range.",
-            evidence_ids=("npm.instances", "alert.vulnerable_range"),
+            summary="Every recorded dependency instance is outside the vulnerable range.",
+            evidence_ids=("dependency.instances", "alert.vulnerable_range"),
         )
         return TriageDecision(
             priority=priority,
@@ -334,7 +407,7 @@ def decide_triage(bundle: EvidenceBundle, policy: Policy) -> TriageDecision:
         else "triage_rule_disabled"
     )
     missing_evidence = (
-        ("complete npm evidence",)
+        ("complete dependency evidence",)
         if reason_code == "triage_inconclusive_human_review"
         else ("enabled triage_inconclusive_human_review rule",)
     )
@@ -374,19 +447,20 @@ def _approval_is_proven(
     ):
         return False
     if (
-        bundle.npm.completeness != "complete"
+        "complete_inventory" not in bundle.dependency.proof_capabilities
         or finding.injection_detected
         or finding.insufficient_context
     ):
         return False
     if finding.policy_reason_code == "vulnerable_symbol_unused":
         return (
-            bool(bundle.npm.instances)
+            bool(bundle.dependency.instances)
             and all(
                 instance.relationship in FIRST_PARTY_RELATIONSHIPS
-                for instance in bundle.npm.instances
+                for instance in bundle.dependency.instances
             )
-            and not bundle.npm.dependency_consumers
+            and not bundle.dependency.dependency_consumers
+            and "dependency_consumers_complete" in bundle.dependency.proof_capabilities
             and repository_reference_evidence is not None
             and repository_reference_evidence.target_identifier == bundle.alert.package_name
             and repository_reference_evidence.status == "sufficient_absence"
@@ -394,10 +468,14 @@ def _approval_is_proven(
     if finding.policy_reason_code == "dev_only_scope":
         return (
             bundle.alert.scope == "development"
-            and bool(bundle.npm.instances)
-            and all(instance.relationship == "development" for instance in bundle.npm.instances)
-            and all(instance.development_only for instance in bundle.npm.instances)
-            and not bundle.npm.dependency_consumers
+            and bool(bundle.dependency.instances)
+            and all(
+                instance.relationship == "development" for instance in bundle.dependency.instances
+            )
+            and all(instance.development_only for instance in bundle.dependency.instances)
+            and not bundle.dependency.dependency_consumers
+            and "dependency_consumers_complete" in bundle.dependency.proof_capabilities
+            and "development_scope" in bundle.dependency.proof_capabilities
         )
     return False
 
@@ -409,9 +487,67 @@ def _finding_is_permitted(finding: AgentFinding, task: AgentTask) -> bool:
     )
 
 
-def _denial_is_proven(finding: AgentFinding) -> bool:
+def _python_dependency_provenance_is_present(bundle: EvidenceBundle) -> bool:
+    if bundle.dependency.instances:
+        return True
+    for declaration in bundle.dependency.declarations:
+        try:
+            identity = normalize_package_identifier(
+                bundle.alert.ecosystem,
+                declaration.name,
+            )
+        except ValueError:
+            continue
+        if identity == bundle.alert.package_identity:
+            return True
+    return False
+
+
+def _python_reachability_is_proven(
+    finding: AgentFinding,
+    task: AgentTask,
+    reachability_evidence: ReachabilityEvidence | None,
+) -> bool:
+    authoritative_targets = {target.value for target in task.import_targets if target.authoritative}
+    expected_targets = tuple(target.value for target in task.import_targets)
+    if (
+        not authoritative_targets
+        or reachability_evidence is None
+        or reachability_evidence.status != "syntax_usage_found"
+        or reachability_evidence.snapshot_id != task.snapshot_id
+        or reachability_evidence.package_name != task.package_name
+        or reachability_evidence.target_identifiers != expected_targets
+    ):
+        return False
+    return any(
+        reachability_finding.language.casefold() == "python"
+        and reachability_finding.matched_target in authoritative_targets
+        and reachability_finding.kind in {"static_import", "dynamic_import"}
+        and reachability_finding.citation in finding.citations
+        for reachability_finding in reachability_evidence.findings
+    )
+
+
+def _denial_is_proven(
+    finding: AgentFinding,
+    task: AgentTask,
+    bundle: EvidenceBundle,
+    *,
+    reachability_evidence: ReachabilityEvidence | None,
+) -> bool:
+    family = analysis_family(bundle.alert.ecosystem)
+    if family == "python" and finding.policy_reason_code != "advisory_applies":
+        return False
     if finding.policy_reason_code == "advisory_applies":
-        return bool(finding.citations)
+        if not finding.citations:
+            return False
+        if family == "javascript_typescript":
+            return True
+        return _python_dependency_provenance_is_present(bundle) and _python_reachability_is_proven(
+            finding,
+            task,
+            reachability_evidence,
+        )
     return True
 
 
@@ -422,6 +558,7 @@ def reconcile(
     policy: Policy,
     *,
     repository_reference_evidence: RepositoryReferenceEvidence | None,
+    reachability_evidence: ReachabilityEvidence | None = None,
 ) -> DismissalDecision:
     """Apply reason-specific certainty checks to a validated dismissal finding."""
     contextual_proofs = _tolerable_risk_context_proofs(bundle, policy)
@@ -461,7 +598,12 @@ def reconcile(
             agent_findings=(finding,),
             missing_evidence=("complete trusted non-applicability proof",),
         )
-    if finding.proposed_recommendation == "deny" and not _denial_is_proven(finding):
+    if finding.proposed_recommendation == "deny" and not _denial_is_proven(
+        finding,
+        task,
+        bundle,
+        reachability_evidence=reachability_evidence,
+    ):
         return DismissalDecision(
             recommendation="human_review",
             reason_code="agent_denial_unproven",
@@ -485,6 +627,7 @@ def reconcile_triage(
     policy: Policy,
     *,
     repository_reference_evidence: RepositoryReferenceEvidence | None,
+    reachability_evidence: ReachabilityEvidence | None = None,
 ) -> TriageDecision:
     """Map a validated agent finding to the triage result vocabulary."""
     unresolved_assessment: Literal["applies", "human_review"] = (
@@ -535,7 +678,12 @@ def reconcile_triage(
             agent_findings=(finding,),
         )
     if finding.proposed_recommendation == "deny":
-        if not _denial_is_proven(finding):
+        if not _denial_is_proven(
+            finding,
+            task,
+            bundle,
+            reachability_evidence=reachability_evidence,
+        ):
             return TriageDecision(
                 priority=baseline.priority,
                 assessment=unresolved_assessment,
