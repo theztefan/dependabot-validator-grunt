@@ -108,7 +108,7 @@ dev = [
 
 [[package]]
 name = "github-copilot-sdk"
-version = "1.0.13"
+version = "1.0.19"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
@@ -116,7 +116,7 @@ dependencies = [
     { name = "python-dateutil" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2d/6d/4f2e3dddc576ff49739317adba6f9b8c35e93b835ece923e46f1b7fa6028/github_copilot_sdk-1.0.13-py3-none-any.whl", hash = "sha256:941dd5b55cf32ba55c73c651052a4a52b259b470c68bf6a6ac3d240c235402c9", size = 588198, upload-time = "2026-09-04T21:31:02.063Z" },
+    { url = "https://files.pythonhosted.org/packages/10/a5/4aca0e11ab250bcc5893cca442815c2dfa62191545a8d6d3d906db1125ac/github_copilot_sdk-1.0.19-py3-none-any.whl", hash = "sha256:25222c170e75d8beee29056ad68155d5345b79542b59315a3dafd40a0a3a12dd", size = 794259, upload-time = "2026-10-09T16:13:09.617Z" },
 ]
 
 [[package]]
